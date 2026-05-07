@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from meet.summarize import _build_system_prompt
 from meet.languages import SECTION_HEADERS as _SECTION_HEADERS
 
@@ -40,3 +38,33 @@ class TestBuildSystemPrompt:
     def test_unknown_language_falls_back_to_english(self):
         prompt = _build_system_prompt("xx")
         assert "Meeting Overview" in prompt
+
+    def test_prompt_file_path_includes_json_contract(self):
+        """The prompt loaded from disk must instruct the LLM to emit a
+        fenced JSON block — this is the schema_version 1 contract."""
+        prompt = _build_system_prompt("en")
+        assert "```json" in prompt
+        assert "action_items" in prompt
+        assert "REQUIRED" in prompt
+
+    def test_inline_fallback_includes_json_contract(self, monkeypatch):
+        """When the prompt file is missing, the inline fallback must still
+        carry the JSON contract so meet ingest / record never silently
+        ships frontmatter-less summaries."""
+        import meet.summarize as sm
+
+        # Force the loader to act as if the prompt files were missing.
+        monkeypatch.setattr(sm, "_load_prompt", lambda _: None)
+        prompt = sm._build_system_prompt("en")
+        assert "```json" in prompt
+        assert "action_items" in prompt
+        assert '"open"' in prompt  # status enumeration documented
+
+    def test_format_inline_fallback_includes_json_contract(self, monkeypatch):
+        """Same contract for the two-pass format prompt fallback."""
+        import meet.summarize as sm
+
+        monkeypatch.setattr(sm, "_load_prompt", lambda _: None)
+        prompt = sm._build_format_system_prompt("en")
+        assert "json" in prompt.lower()
+        assert "action_items" in prompt

@@ -1549,7 +1549,12 @@ def post_process(
                 language=transcript.language,
                 progress_callback=progress_callback,
             )
-            path = summary_result.save(output_dir, basename)
+            from meet.frontmatter import context_from_transcript
+
+            fm_ctx = context_from_transcript(transcript, output_dir)
+            path = summary_result.save(
+                output_dir, basename, frontmatter_context=fm_ctx,
+            )
             result["summary"] = path
             _log(f"Summary generated in {summary_result.elapsed_seconds:.1f}s")
         except Exception as exc:

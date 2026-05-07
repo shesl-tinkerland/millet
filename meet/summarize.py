@@ -22,7 +22,10 @@ import os
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from meet.frontmatter import FrontmatterContext
 
 import re
 import requests
@@ -127,12 +130,28 @@ and produce a structured summary.
 * Unresolved question or follow-up item.
 (If none, write "{h['none_stated']}".)
 
+After the Markdown sections, append exactly ONE fenced JSON block with the same content as structured data:
+
+```json
+{{
+  "participants": ["Alice", "Bob"],
+  "topics": ["Topic name"],
+  "action_items": [
+    {{"assignee": "Alice", "task": "Send doc", "due": null, "status": "open"}}
+  ],
+  "decisions": [
+    {{"text": "Use X over Y", "topic": null}}
+  ]
+}}
+```
+
 Rules:
 - Use speaker labels exactly as they appear — do not rename or invent names
 - Do not hallucinate — every item must be traceable to the transcript
 - Be concise but information-dense
 - Preserve technical specificity: name exact tools, APIs, frameworks mentioned
-- Keep the summary professional and objective{lang_instruction}"""
+- Keep the summary professional and objective
+- The JSON block: every field is REQUIRED. Use [] for empty lists, null for unknown assignee/due/topic. action_items.status must be one of "open", "closed", "blocked" — default to "open". The JSON content must be in English even when the body is in another language.{lang_instruction}"""
 
 
 def _load_user_prompt_template() -> str:
@@ -209,7 +228,13 @@ def _build_format_system_prompt(language: str | None = None) -> str:
     return (
         f"Format the extracted meeting data into Markdown with sections: "
         f"## {h['overview']}, ## {h['topics']}, ## {h['actions']}, "
-        f"## {h['decisions']}, ## {h['questions']}.{lang_instruction}"
+        f"## {h['decisions']}, ## {h['questions']}.\n\n"
+        "After the Markdown sections, append exactly ONE fenced ```json block "
+        'with keys "participants", "topics", "action_items", "decisions". '
+        "Every field is REQUIRED — use [] for empty lists, null for unknown "
+        'assignee/due/topic. action_items.status must be one of "open", '
+        '"closed", or "blocked". JSON must be in English even when the body '
+        f"is in another language.{lang_instruction}"
     )
 
 
@@ -308,7 +333,14 @@ class SummaryConfig:
 
 @dataclass
 class MeetingSummary:
-    """Result of a meeting summary generation."""
+    """Result of a meeting summary generation.
+
+    ``markdown`` always holds the human-readable Markdown body suitable for
+    PDF rendering — never the trailing JSON data block.  When the LLM
+    emitted a structured data block (the contract since schema_version 1),
+    the parsed dict is stashed in ``data`` and the body is stripped before
+    storage.  See ``meet.frontmatter`` for the schema.
+    """
 
     markdown: str
     model: str
@@ -319,23 +351,64 @@ class MeetingSummary:
     pass2_seconds: float | None = None
     pass1_chars: int | None = None
     extraction: str | None = None  # Raw Pass 1 output (kept in-memory only)
+    # Structured data parsed out of the LLM completion (schema_version 1).
+    # ``None`` means the model didn't emit a JSON block or it failed to
+    # parse; ``data_error`` records why so the indexer can flag it.
+    data: dict[str, Any] | None = None
+    data_error: str | None = None
 
-    def save(self, output_dir: str | Path, basename: str) -> Path:
-        """Save the summary as a .summary.md file and a .summary.meta.json sidecar.
+    def save(
+        self,
+        output_dir: str | Path,
+        basename: str,
+        *,
+        frontmatter_context: "FrontmatterContext | None" = None,
+    ) -> Path:
+        """Save the summary as a ``.summary.md`` file plus sidecars.
 
-        The sidecar records which backend/model produced the summary so that
-        it can be determined post-hoc.  When the two-pass Ollama flow was used,
-        per-pass timings and the extracted-data character count are recorded too.
+        When ``frontmatter_context`` is provided, the saved Markdown is
+        prefixed with a YAML frontmatter block built from the LLM's
+        structured data + the session-level context.  A
+        ``.frontmatter.json`` sidecar is also written so consumers that
+        don't want to parse YAML can read the same data verbatim.
 
-        Returns the path to the saved .summary.md file.
+        When ``frontmatter_context`` is ``None`` we fall back to the
+        legacy behavior (raw Markdown body, no frontmatter) for callers
+        that haven't been migrated yet.
+
+        The ``.summary.meta.json`` sidecar continues to record which
+        backend/model produced the summary, plus per-pass timings for
+        the two-pass Ollama flow.
+
+        Returns the path to the saved ``.summary.md`` file.
         """
         import datetime
+
+        # Local import to avoid a circular import at module load time.
+        from meet.frontmatter import (
+            build_frontmatter,
+            render_frontmatter_block,
+            write_frontmatter_sidecar,
+        )
 
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         md_path = output_dir / f"{basename}.summary.md"
-        md_path.write_text(self.markdown, encoding="utf-8")
+
+        if frontmatter_context is not None:
+            fm = build_frontmatter(
+                self.data,
+                frontmatter_context,
+                extraction_error=self.data_error,
+            )
+            md_path.write_text(
+                render_frontmatter_block(fm) + self.markdown,
+                encoding="utf-8",
+            )
+            write_frontmatter_sidecar(output_dir, basename, fm)
+        else:
+            md_path.write_text(self.markdown, encoding="utf-8")
 
         meta: dict[str, Any] = {
             "backend": self.backend,
@@ -349,6 +422,10 @@ class MeetingSummary:
             meta["pass2_seconds"] = round(self.pass2_seconds or 0.0, 2)
             if self.pass1_chars is not None:
                 meta["pass1_chars"] = self.pass1_chars
+        if self.data_error:
+            meta["data_error"] = self.data_error
+        elif self.data is not None:
+            meta["data_extracted"] = True
         meta_path = output_dir / f"{basename}.summary.meta.json"
         meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -858,6 +935,20 @@ def _dispatch(
             )
         else:
             result = _summarize_ollama(system_prompt, user_prompt, fallback_config)
+
+    # Split the trailing JSON data block off the markdown body so that
+    # PDF rendering keeps using the body and frontmatter writers can
+    # consume the parsed data.  Done once here so every backend benefits.
+    from meet.frontmatter import split_body_and_data
+
+    body, data, data_error = split_body_and_data(result.markdown)
+    result.markdown = body
+    result.data = data
+    # Only record an error if extraction failed AND the prompt should
+    # have produced data; "no JSON block found" on a model that ignored
+    # the contract is still useful diagnostic info, so keep it.
+    if data is None:
+        result.data_error = data_error
 
     # Defense-in-depth: catch error text masquerading as a valid summary
     _validate_summary_content(result.markdown, backend)

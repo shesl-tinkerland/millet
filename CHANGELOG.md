@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.7.0 — 2026-05-08
+
+### Features
+
+- **Structured YAML frontmatter on every summary (schema_version 1)** —
+  `.summary.md` now begins with a typed YAML frontmatter block carrying
+  `participants`, `topics`, `action_items` (with assignee, task, due,
+  status), `decisions` (text, topic), `language`, `duration`, and a
+  `source` pointer. A matching `.frontmatter.json` sidecar is written
+  next to it for tools that don't want to parse YAML. The schema is
+  intentionally small in v1; downstream tools (e.g. the
+  [vezir](https://github.com/pretyflaco/vezir) 0.2.0+ indexer) build
+  richer derived views over this stable surface. See the README's
+  "Structured frontmatter" section for the schema.
+- **`meet ingest` subcommand** — re-extract structured frontmatter for
+  one or more existing session directories. Idempotent: skips sessions
+  whose `.summary.meta.json` already records `data_extracted: true`
+  unless `--force` is passed. Accepts the standard summary-backend
+  flags. `--dry-run` previews without invoking the LLM. `--no-pdf`
+  skips PDF regeneration.
+- **LLM contract: fenced JSON data block** — every summarization prompt
+  (single-pass, two-pass formatter, and inline fallbacks) instructs
+  the model to append exactly one fenced ```json block at the end of
+  its output with the structured fields. Single source of truth: the
+  Markdown body still drives the PDF, the JSON block populates the
+  frontmatter. JSON is required to be in English even when the body is
+  in another language so cross-language indexing works.
+
+### Internals
+
+- New module `meet/frontmatter.py`: schema, build/parse/validate, YAML
+  render and read-back, and a `context_from_transcript()` helper that
+  pulls `started_at` / `title` from the session's `*.session.json`.
+  No PyYAML dependency added; the writer is small enough to maintain
+  in-tree and the reader prefers PyYAML when installed but falls back
+  to a tightly-scoped subset parser otherwise.
+- `MeetingSummary.save(out_dir, basename, *, frontmatter_context=...)` —
+  new keyword argument. When provided, the saved Markdown is prefixed
+  with the YAML block and a `.frontmatter.json` sidecar is written.
+  When omitted, behavior is unchanged from 0.6.x for backward
+  compatibility.
+- `_dispatch()` in `summarize.py` strips the trailing JSON block off
+  every backend's output once, so PDF rendering keeps using a clean
+  Markdown body and `MeetingSummary.data` exposes the parsed dict to
+  callers.
+- `meet label` (find-and-replace fallback) splits, replaces, and
+  re-renders both the YAML frontmatter and the JSON sidecar in step
+  with the body, so renames stay consistent across all four artifacts.
+- The summary `.summary.meta.json` sidecar now records
+  `data_extracted: true` on success or `data_error: "<reason>"` on
+  failure to extract.
+
+### Backwards compatibility
+
+- All callers that don't pass `frontmatter_context=` to
+  `MeetingSummary.save()` continue to produce the legacy artifacts.
+- Sessions recorded before 0.7.0 work unchanged; run `meet ingest` to
+  upgrade them to schema_version 1.
+
+### Tests
+
+- 33 new tests across `tests/test_frontmatter.py` (24) and
+  `tests/test_ingest.py` (9), plus 3 new assertions in
+  `tests/test_summarize.py` confirming both the on-disk and inline
+  fallback prompts carry the JSON contract.
+
+---
+
 ## v0.4.2 — 2026-04-24
 
 ### Improvements

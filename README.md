@@ -56,10 +56,16 @@ including browser-based meetings and standalone desktop clients.
 - **Professional PDF output** -- summary + full transcript in a clean,
   page-numbered PDF with full Unicode support (DejaVu Sans) and RTL for Farsi
 - **Multiple output formats** -- `.txt`, `.srt`, `.json`, `.summary.md`, `.pdf`
+- **Structured YAML frontmatter** -- every `.summary.md` carries a typed
+  schema (action items, decisions, participants, topics, language,
+  duration) plus a matching `.frontmatter.json` sidecar, ready for
+  indexers and downstream tooling like
+  [vezir](https://github.com/pretyflaco/vezir)
 - **GTK3 GUI widget** -- small always-on-top window with record/stop, timer,
   and one-click access to results
 - **CLI** -- `meet record`, `meet transcribe`, `meet run`, `meet gui`,
-  `meet label`, `meet enroll`, `meet sync`, `meet devices`, `meet check`
+  `meet label`, `meet enroll`, `meet sync`, `meet ingest`,
+  `meet devices`, `meet check`
 - **Per-session folders** -- each recording gets its own organized directory
 - **Offline-first** -- after initial model download, core features work without
   internet; cloud backends are optional upgrades
@@ -294,14 +300,16 @@ Each recording gets its own session directory:
 
 ```
 ~/meet-recordings/meeting-20260312-140000/
-    meeting-20260312-140000.wav            # Stereo audio (16kHz)
-    meeting-20260312-140000.session.json   # Recording metadata
-    meeting-20260312-140000.ffmpeg.log     # ffmpeg capture log
-    meeting-20260312-140000.txt            # Plain text transcript
-    meeting-20260312-140000.srt            # Subtitle format
-    meeting-20260312-140000.json           # Full detail (word-level timestamps)
-    meeting-20260312-140000.summary.md     # AI meeting summary (Markdown)
-    meeting-20260312-140000.pdf            # Professional PDF (summary + transcript)
+    meeting-20260312-140000.wav                 # Stereo audio (16kHz)
+    meeting-20260312-140000.session.json        # Recording metadata
+    meeting-20260312-140000.ffmpeg.log          # ffmpeg capture log
+    meeting-20260312-140000.txt                 # Plain text transcript
+    meeting-20260312-140000.srt                 # Subtitle format
+    meeting-20260312-140000.json                # Full detail (word-level timestamps)
+    meeting-20260312-140000.summary.md          # AI meeting summary with YAML frontmatter
+    meeting-20260312-140000.summary.meta.json   # Summary backend/model + timing metadata
+    meeting-20260312-140000.frontmatter.json    # Structured frontmatter (schema_version 1)
+    meeting-20260312-140000.pdf                 # Professional PDF (summary + transcript)
 ```
 
 Example `.txt` output:
@@ -311,6 +319,77 @@ Example `.txt` output:
 [00:00:19 --> 00:00:25] REMOTE_1: Right, I think we should implement exponential backoff.
 [00:00:26 --> 00:00:31] YOU: Agreed. Can you also look at caching the responses?
 ```
+
+### Structured frontmatter
+
+Every `.summary.md` ships with a typed YAML frontmatter block plus a
+matching `.frontmatter.json` sidecar.  The schema is intentionally
+small in v1 so downstream consumers can rely on it:
+
+```yaml
+---
+schema_version: 1
+type: meeting
+title: Q2 Pricing Discussion
+date: "2026-03-17T14:00:00+00:00"
+duration: PT42M17S
+language: en
+participants:
+  - name: YOU
+    role: null
+    channel: mic
+  - name: Alice
+    role: null
+    channel: system
+topics:
+  - pricing
+  - onboarding
+action_items:
+  - assignee: Alice
+    task: Send pricing doc
+    due: Friday
+    status: open
+decisions:
+  - text: Run pricing experiment at $99/mo
+    topic: pricing
+source:
+  session_id: meeting-20260312-140000
+  audio_sha256: null
+---
+## Meeting Overview
+...
+
+## Key Topics Discussed
+...
+```
+
+`schema_version: 1` is what every consumer should pin against.
+The JSON sidecar contains the exact same dict for tools that don't
+want to parse YAML.  `[vezir](https://github.com/pretyflaco/vezir)
+0.2.0+` reads these files directly to build a queryable index over
+your meetings.
+
+### Backfilling existing sessions
+
+Sessions recorded before meetscribe 0.7.0 don't carry frontmatter.
+Re-extract it for one or more sessions with:
+
+```bash
+# Re-run the LLM to produce frontmatter; idempotent (skips sessions
+# whose .summary.meta.json already records data_extracted=true).
+meet ingest ~/meet-recordings/meeting-2026*
+
+# Force re-extraction even when frontmatter is already present:
+meet ingest --force ~/meet-recordings/meeting-20260312-140000
+
+# Preview without invoking the LLM:
+meet ingest --dry-run ~/meet-recordings/meeting-2026*
+```
+
+`meet ingest` accepts the same `--summary-backend` /
+`--summary-model` / `--ollama-singlepass` flags as
+`meet transcribe` and regenerates the PDF by default
+(`--no-pdf` to skip).
 
 ## AI summary
 

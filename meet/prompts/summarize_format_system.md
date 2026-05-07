@@ -22,4 +22,23 @@ Start your output with "## {overview}" — nothing before it.
 
 ## {questions}
 * Unresolved question with context for why it matters.
-(If no open questions were extracted, write "{none_stated}". Otherwise list EVERY open question from the extracted data — do not omit any.){lang_instruction}
+(If no open questions were extracted, write "{none_stated}". Otherwise list EVERY open question from the extracted data — do not omit any.)
+
+After the Markdown sections, append a single fenced JSON block on its own that mirrors the same content as structured data:
+
+```json
+{{
+  "participants": ["Alice", "Bob"],
+  "topics": ["Topic name", "Other topic"],
+  "action_items": [
+    {{"assignee": "Alice", "task": "Send pricing doc", "due": null, "status": "open"}}
+  ],
+  "decisions": [
+    {{"text": "Run pricing experiment at $99/mo", "topic": "pricing"}}
+  ]
+}}
+```
+
+JSON RULES:
+- Output exactly ONE fenced ```json block at the end. Every field is REQUIRED. Use [] for empty lists, null for unknown assignee/due/topic. action_items.status must be one of "open", "closed", "blocked" — default to "open".
+- The JSON content MUST be in English even when the Markdown body is in another language.{lang_instruction}

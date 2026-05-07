@@ -379,7 +379,12 @@ def apply_labels(
                     transcript.to_text(), summary_config,
                     language=transcript.language,
                 )
-                path = summary_result.save(session_dir, basename)
+                from meet.frontmatter import context_from_transcript
+
+                fm_ctx = context_from_transcript(transcript, session_dir)
+                path = summary_result.save(
+                    session_dir, basename, frontmatter_context=fm_ctx,
+                )
                 result_files["summary"] = path
                 _log(f"Summary regenerated in {summary_result.elapsed_seconds:.1f}s")
             else:
@@ -391,18 +396,56 @@ def apply_labels(
             regenerate_summary = False
 
     if not regenerate_summary and files.get("summary") and files["summary"].exists():
-        # Best-effort find-and-replace on existing summary
+        # Best-effort find-and-replace on existing summary.
+        # The summary may carry a YAML frontmatter block — split it off so
+        # we don't accidentally rename inside structural keys, and so the
+        # PDF gets a clean Markdown body.
         _log("Updating speaker names in existing summary...")
-        summary_text = files["summary"].read_text(encoding="utf-8")
-        for old_label, new_label in label_map.items():
-            summary_text = summary_text.replace(old_label, new_label)
-        files["summary"].write_text(summary_text, encoding="utf-8")
+        from meet.frontmatter import (
+            parse_frontmatter_block,
+            render_frontmatter_block,
+            write_frontmatter_sidecar,
+        )
+
+        raw = files["summary"].read_text(encoding="utf-8")
+        fm_dict, body = parse_frontmatter_block(raw)
+
+        def _replace_all(s: str) -> str:
+            for old_label, new_label in label_map.items():
+                s = s.replace(old_label, new_label)
+            return s
+
+        body = _replace_all(body)
+
+        if fm_dict is not None:
+            # Walk the structured frontmatter and apply the same renames
+            # to participant names, action_item.assignee, etc.  We only
+            # touch string fields the schema knows about, leaving anything
+            # exotic alone.
+            for p in fm_dict.get("participants") or []:
+                if isinstance(p, dict) and isinstance(p.get("name"), str):
+                    p["name"] = _replace_all(p["name"])
+            for ai in fm_dict.get("action_items") or []:
+                if isinstance(ai, dict):
+                    if isinstance(ai.get("assignee"), str):
+                        ai["assignee"] = _replace_all(ai["assignee"])
+                    if isinstance(ai.get("task"), str):
+                        ai["task"] = _replace_all(ai["task"])
+            for d in fm_dict.get("decisions") or []:
+                if isinstance(d, dict) and isinstance(d.get("text"), str):
+                    d["text"] = _replace_all(d["text"])
+            new_text = render_frontmatter_block(fm_dict) + body
+            write_frontmatter_sidecar(session_dir, basename, fm_dict)
+        else:
+            new_text = body
+
+        files["summary"].write_text(new_text, encoding="utf-8")
         result_files["summary"] = files["summary"]
 
-        # Load summary for PDF embedding
+        # Load body-only summary for PDF embedding
         from meet.summarize import MeetingSummary
         summary_result = MeetingSummary(
-            markdown=summary_text, model="(relabeled)", elapsed_seconds=0,
+            markdown=body, model="(relabeled)", elapsed_seconds=0,
         )
 
     # ── PDF ──
