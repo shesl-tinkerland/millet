@@ -108,6 +108,13 @@ def _generate_summary(
         return result
     except Exception as exc:
         click.echo(f"  Summary failed: {exc}", err=True)
+        if summary_preset:
+            # When a preset was explicitly selected (e.g. "confidential"),
+            # the user chose a specific privacy/quality level.  Silently
+            # returning no summary would make the failure invisible to the
+            # caller (vezir worker, GUI) and yield a misleading "success".
+            # Re-raise so `meet transcribe` exits non-zero.
+            raise
         return None
 
 
@@ -437,17 +444,24 @@ def transcribe(
 
     # ── Summary + PDF ──
     summary_result = None
+    preset_summary_error: Exception | None = None
     if summarize:
-        summary_result = _generate_summary(
-            transcript,
-            out_dir,
-            audio_path.stem,
-            summary_model,
-            files,
-            summary_backend=summary_backend,
-            summary_preset=summary_preset,
-            ollama_singlepass=ollama_singlepass,
-        )
+        try:
+            summary_result = _generate_summary(
+                transcript,
+                out_dir,
+                audio_path.stem,
+                summary_model,
+                files,
+                summary_backend=summary_backend,
+                summary_preset=summary_preset,
+                ollama_singlepass=ollama_singlepass,
+            )
+        except Exception as exc:
+            # Only raised when summary_preset was set (preset guard).
+            # Generate the PDF first so the transcript artifact still
+            # exists, then surface the failure as a non-zero exit below.
+            preset_summary_error = exc
 
     _generate_pdf(transcript, out_dir, audio_path.stem, summary_result, files)
 
@@ -470,6 +484,21 @@ def transcribe(
         click.echo(line)
     if len(lines) > 20:
         click.echo(f"  ... ({len(lines) - 20} more lines, see {files['text']})")
+
+    if preset_summary_error is not None:
+        # Preset summary failure: surface as non-zero exit so callers
+        # (vezir worker, CI) can detect the partial failure.  The transcript
+        # and PDF are already on disk for inspection.
+        click.echo(err=True)
+        click.echo(
+            click.style(
+                f"Error: summary failed for preset "
+                f"'{summary_preset}': {preset_summary_error}",
+                fg="red",
+            ),
+            err=True,
+        )
+        raise SystemExit(1)
 
 
 @main.command()

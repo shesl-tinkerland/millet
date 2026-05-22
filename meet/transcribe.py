@@ -1556,6 +1556,11 @@ def post_process(
 
     result: dict = {"summary": None, "pdf": None}
     summary_result = None
+    # When a preset was explicitly selected, summary failure is fatal: the
+    # caller (e.g. `meet transcribe` CLI, vezir worker) must learn about it
+    # via a non-zero exit so it can mark the job as errored.  We still
+    # generate the PDF (so the transcript artifact exists) before raising.
+    preset_summary_error: Exception | None = None
 
     if summarize:
         try:
@@ -1588,6 +1593,10 @@ def post_process(
             _log(f"Summary generated in {summary_result.elapsed_seconds:.1f}s")
         except Exception as exc:
             _log(f"Summary failed: {exc}")
+            if summary_preset:
+                # Preset was explicit — user chose a specific privacy/quality
+                # level.  Remember the failure and raise after PDF is written.
+                preset_summary_error = exc
 
     try:
         from meet.pdf import generate_pdf
@@ -1615,5 +1624,14 @@ def post_process(
             _log(f"Audio compressed: {ogg_path.name}")
         except Exception as exc:
             _log(f"Audio compression failed (WAV kept): {exc}")
+
+    if preset_summary_error is not None:
+        # Surface the preset-summary failure as a non-zero exit.  The
+        # transcript, PDF, and audio artifacts are already on disk for
+        # forensic / retry purposes.
+        raise RuntimeError(
+            f"summary failed for preset '{summary_preset}': "
+            f"{preset_summary_error}"
+        ) from preset_summary_error
 
     return result
