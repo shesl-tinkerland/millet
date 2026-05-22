@@ -1526,6 +1526,7 @@ def post_process(
     summarize: bool = True,
     summary_backend: str | None = None,
     summary_model: str | None = None,
+    summary_preset: str | None = None,
     ollama_singlepass: bool = False,
     progress_callback=None,
 ) -> dict:
@@ -1549,6 +1550,7 @@ def post_process(
     """
 
     def _log(msg: str) -> None:
+        print(f"  {msg}")  # Always visible in terminal
         if progress_callback:
             progress_callback(msg)
 
@@ -1560,6 +1562,8 @@ def post_process(
             from meet.summarize import summarize as do_summarize, SummaryConfig
 
             cfg_kwargs: dict = {}
+            if summary_preset:
+                cfg_kwargs["preset"] = summary_preset
             if summary_backend:
                 cfg_kwargs["backend"] = summary_backend
             if summary_model:

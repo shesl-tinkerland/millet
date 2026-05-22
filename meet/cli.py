@@ -60,7 +60,7 @@ def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
 
 def _generate_summary(
     transcript, out_dir, basename, summary_model, files, summary_backend=None,
-    ollama_singlepass=False,
+    summary_preset=None, ollama_singlepass=False,
 ):
     """Generate an AI meeting summary. Returns MeetingSummary or None.
 
@@ -76,6 +76,8 @@ def _generate_summary(
     from meet.summarize import summarize as do_summarize, SummaryConfig
 
     config_kwargs = {}
+    if summary_preset:
+        config_kwargs["preset"] = summary_preset
     if summary_backend:
         config_kwargs["backend"] = summary_backend
     if summary_model:
@@ -284,9 +286,15 @@ def main():
     help="Generate AI meeting summary (default: on)",
 )
 @click.option(
+    "--summary-preset",
+    type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
+    default=None,
+    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
+        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
     help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
@@ -331,6 +339,7 @@ def transcribe(
     output_dir,
     no_diarize,
     summarize,
+    summary_preset,
     summary_backend,
     summary_model,
     ollama_singlepass,
@@ -436,6 +445,7 @@ def transcribe(
             summary_model,
             files,
             summary_backend=summary_backend,
+            summary_preset=summary_preset,
             ollama_singlepass=ollama_singlepass,
         )
 
@@ -514,9 +524,15 @@ def transcribe(
     help="Generate AI meeting summary (default: on)",
 )
 @click.option(
+    "--summary-preset",
+    type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
+    default=None,
+    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
+        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
     help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
@@ -560,6 +576,7 @@ def run(
     max_speakers,
     virtual_sink,
     summarize,
+    summary_preset,
     summary_backend,
     summary_model,
     ollama_singlepass,
@@ -673,6 +690,7 @@ def run(
                 summary_model,
                 files,
                 summary_backend=summary_backend,
+                summary_preset=summary_preset,
                 ollama_singlepass=ollama_singlepass,
             )
 
@@ -926,9 +944,15 @@ def translate(session_dir, target_lang, summary_model):
     "without prompting; unrecognized speakers are prompted interactively.",
 )
 @click.option(
+    "--summary-preset",
+    type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
+    default=None,
+    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
+        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
     help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
@@ -945,7 +969,7 @@ def translate(session_dir, target_lang, summary_model):
     default=False,
     help="Use the legacy single-pass Ollama flow instead of the default two-pass (extract+format) flow. The two-pass flow is more accurate on local 20B-class models but adds one extra LLM call. Also configurable via MEETSCRIBE_OLLAMA_SINGLEPASS=1.",
 )
-def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_model, ollama_singlepass):
+def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backend, summary_model, ollama_singlepass):
     """Assign real names to speakers in a transcribed session.
 
     \b
@@ -1162,6 +1186,7 @@ def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_mode
         session_path,
         label_map,
         regenerate_summary=regenerate_summary,
+        summary_preset=summary_preset,
         summary_backend=summary_backend,
         summary_model=summary_model,
         ollama_singlepass=ollama_singlepass,
@@ -1174,29 +1199,47 @@ def label(session_dir, no_audio, no_summary, auto, summary_backend, summary_mode
         click.echo(f"  {fmt}: {path}")
 
     # ── Update voice profiles with confirmed labels ──
+    # Only update profiles for speakers that were manually confirmed by the
+    # user (typed interactively), NOT for auto-matched speakers.  Auto-matches
+    # can be wrong (especially when the mic channel is very quiet), and
+    # updating profiles from incorrect matches causes profile drift.
     if auto and label_map:
-        click.echo()
-        click.echo("Updating voice profiles with confirmed labels...")
-        try:
-            from meet.voiceprint import update_profiles_from_confirmed_labels
+        # manual_labels: speakers the user typed a name for during this session
+        manual_labels = {
+            sp_id: name
+            for sp_id, name in label_map.items()
+            if sp_id not in auto_matches
+        }
+        profile_labels = label_map if not auto_matches else manual_labels
+        if not profile_labels:
+            click.echo()
+            click.echo(
+                "  Skipping profile update (all labels were auto-matched; "
+                "use 'meet enroll' to update profiles from verified labels)."
+            )
+        else:
+            click.echo()
+            click.echo("Updating voice profiles with manually confirmed labels...")
+            try:
+                from meet.voiceprint import update_profiles_from_confirmed_labels
 
-            transcript = _load_transcript(files["json"])
-            # Rebuild channel_map if not already done
-            if not channel_map:
-                channel_map = _detect_speaker_channels(
+                transcript = _load_transcript(files["json"])
+                # Rebuild channel_map if not already done
+                if not channel_map:
+                    channel_map = _detect_speaker_channels(
+                        wav_path,
+                        transcript.segments,
+                        transcript.speakers,
+                    )
+                update_profiles_from_confirmed_labels(
                     wav_path,
                     transcript.segments,
-                    transcript.speakers,
+                    profile_labels,
+                    channel_map,
                 )
-            update_profiles_from_confirmed_labels(
-                wav_path,
-                transcript.segments,
-                label_map,
-                channel_map,
-            )
-            click.echo("  Voice profiles updated.")
-        except Exception as exc:
-            click.echo(f"  Profile update failed: {exc}", err=True)
+                click.echo("  Voice profiles updated.")
+            except Exception as exc:
+                click.echo(f"  Profile update failed: {exc}", err=True)
 
 
 @main.command()
@@ -1472,9 +1515,15 @@ def sync(session_dirs, force, meeting_type, list_schedule, init_config):
     help="Generate AI meeting summary (default: on)",
 )
 @click.option(
+    "--summary-preset",
+    type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
+    default=None,
+    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
+        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
     help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
@@ -1508,6 +1557,7 @@ def gui(
     mic,
     monitor,
     summarize,
+    summary_preset,
     summary_backend,
     summary_model,
     ollama_singlepass,
@@ -1532,6 +1582,7 @@ def gui(
         mic=mic,
         monitor=monitor,
         summarize=summarize,
+        summary_preset=summary_preset,
         summary_backend=summary_backend,
         summary_model=summary_model,
         ollama_singlepass=ollama_singlepass,
@@ -1558,6 +1609,7 @@ def _has_frontmatter(summary_meta_path: Path) -> bool:
 def _ingest_one_session(
     session_dir: Path,
     *,
+    summary_preset: str | None = None,
     summary_backend: str | None,
     summary_model: str | None,
     ollama_singlepass: bool,
@@ -1592,6 +1644,8 @@ def _ingest_one_session(
     transcript = _load_transcript(files["json"])
 
     cfg_kwargs: dict = {}
+    if summary_preset:
+        cfg_kwargs["preset"] = summary_preset
     if summary_backend:
         cfg_kwargs["backend"] = summary_backend
     if summary_model:
@@ -1657,9 +1711,15 @@ def _ingest_one_session(
     "implemented); --no-re-llm is reserved and currently rejected.",
 )
 @click.option(
+    "--summary-preset",
+    type=click.Choice(["high-quality", "confidential", "alternative"], case_sensitive=False),
+    default=None,
+    help="Summarization quality/privacy preset. Overrides --summary-backend/--summary-model.",
+)
+@click.option(
     "--summary-backend",
     type=click.Choice(
-        ["ollama", "openrouter", "claudemax", "openai"], case_sensitive=False
+        ["ollama", "openrouter", "claudemax", "openai", "tinfoil"], case_sensitive=False
     ),
     default=None,
     help="Summary backend (default: ollama, or MEETSCRIBE_SUMMARY_BACKEND env var)",
@@ -1697,6 +1757,7 @@ def _ingest_one_session(
 def ingest(
     session_dirs,
     re_llm,
+    summary_preset,
     summary_backend,
     summary_model,
     ollama_singlepass,
@@ -1758,6 +1819,7 @@ def ingest(
         click.echo(f"  • {sd}")
         ok, msg = _ingest_one_session(
             sd,
+            summary_preset=summary_preset,
             summary_backend=summary_backend,
             summary_model=summary_model,
             ollama_singlepass=ollama_singlepass,

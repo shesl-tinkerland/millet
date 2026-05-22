@@ -203,6 +203,7 @@ class MeetRecorderWindow(Gtk.Window):
         capture_kwargs: dict,
         transcribe_kwargs: dict,
         summarize: bool = True,
+        summary_preset: str | None = None,
         summary_backend: str | None = None,
         summary_model: str | None = None,
         ollama_singlepass: bool = False,
@@ -212,6 +213,7 @@ class MeetRecorderWindow(Gtk.Window):
         self._capture_kwargs = capture_kwargs
         self._transcribe_kwargs = transcribe_kwargs
         self._summarize = summarize
+        self._summary_preset = summary_preset
         self._summary_backend = summary_backend
         self._summary_model = summary_model
         self._ollama_singlepass = ollama_singlepass
@@ -268,6 +270,34 @@ class MeetRecorderWindow(Gtk.Window):
         vbox.set_margin_bottom(12)
         vbox.set_margin_start(20)
         vbox.set_margin_end(20)
+
+        # ── Summarization quality preset (always visible, not "advanced") ──
+        preset_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        preset_label = Gtk.Label(label="Summarization:")
+        preset_label.set_xalign(1.0)
+        preset_box.pack_start(preset_label, False, False, 0)
+
+        self._preset_combo = Gtk.ComboBoxText()
+        _PRESET_OPTIONS = [
+            ("high-quality", "High Quality \u2014 Sonnet 4.6"),
+            ("confidential", "Confidential \u2014 DeepSeek V4 Pro (TEE)"),
+            ("alternative",  "Alternative \u2014 Kimi K2.6"),
+        ]
+        for pid, plabel in _PRESET_OPTIONS:
+            self._preset_combo.append(pid, plabel)
+        # Set active from CLI arg, env var, or default
+        initial = self._summary_preset or "high-quality"
+        if not self._preset_combo.set_active_id(initial):
+            self._preset_combo.set_active(0)
+        def _on_preset_changed(combo):
+            self._summary_preset = combo.get_active_id()
+
+        self._preset_combo.connect("changed", _on_preset_changed)
+        # Sync immediately — set_active_id() above fires before the handler
+        # is connected, so self._summary_preset would stay None without this.
+        self._summary_preset = self._preset_combo.get_active_id() or "high-quality"
+        preset_box.pack_start(self._preset_combo, True, True, 0)
+        vbox.pack_start(preset_box, False, False, 0)
 
         # Advanced settings (collapsible) — keeps the widget compact by default
         # but lets users override ASR backend, torch device, and MLX model
@@ -1269,6 +1299,7 @@ class MeetRecorderWindow(Gtk.Window):
             output.parent,
             output.stem,
             summarize=self._summarize,
+            summary_preset=self._summary_preset,
             summary_backend=self._summary_backend,
             summary_model=self._summary_model,
             ollama_singlepass=self._ollama_singlepass,
@@ -1514,6 +1545,7 @@ def launch(
     mic: str | None = None,
     monitor: str | None = None,
     summarize: bool = True,
+    summary_preset: str | None = None,
     summary_backend: str | None = None,
     summary_model: str | None = None,
     ollama_singlepass: bool = False,
@@ -1547,6 +1579,7 @@ def launch(
         capture_kwargs,
         transcribe_kwargs,
         summarize=summarize,
+        summary_preset=summary_preset,
         summary_backend=summary_backend,
         summary_model=summary_model,
         ollama_singlepass=ollama_singlepass,
