@@ -24,9 +24,25 @@ PROFILES_PATH = Path.home() / ".config" / "meet" / "speaker_profiles.json"
 MATCH_THRESHOLD = 0.65  # cosine similarity — below this, don't auto-label
 MIN_SEGMENT_DURATION = 1.5   # seconds — skip very short segments for embedding
 MAX_SEGMENTS_PER_SPEAKER = 10  # how many segments to average per speaker
-MIN_SEGMENT_RMS = 0.005  # normalized float32 RMS — segments quieter than this are
-                         # treated as silence and skipped for embedding extraction.
-                         # Prevents garbage embeddings from near-silent mic channels.
+# Empirically tuned floor for embedding extraction.
+#
+# The purpose of this gate is to reject TRUE silence — clips where the
+# audio is essentially digital quantization noise (~1e-4 RMS) and the
+# embedding model produces meaningless 256-dim vectors that would poison
+# the central profile DB or match against unrelated profiles by chance.
+#
+# It must NOT reject quiet-but-real speech.  Validated case: a Linux
+# thin-client recording with mic mean ~-49.7 dBFS (RMS ~0.003) and peaks
+# at -4 dBFS — all 7 eligible segments had RMS in [0.0016, 0.0024].  The
+# user's voice is matchable against the central 58-profile DB; the
+# embedding extractor needs to see those segments.
+#
+# 0.0015 normalized (~ -56 dBFS) sits well above the silence floor
+# (~ -90 dBFS) and below the lowest validated mic-recording RMS.  Earlier
+# 0.005 (~ -46 dBFS) was too aggressive — it skipped every segment of
+# quiet but real speech, leaving the auto-labeller blind to known
+# speakers.
+MIN_SEGMENT_RMS = 0.0015
 
 
 # ─── Embedding model loading ──────────────────────────────────────────────────
@@ -202,21 +218,29 @@ def _embed_segments(
     import torch
 
     embeddings = []
+    n_too_short = 0
+    n_too_quiet = 0
+    n_considered = 0
     for start, end in segments:
+        n_considered += 1
         start_frame = int(start * sample_rate)
         end_frame = min(int(end * sample_rate), len(samples))
         clip = samples[start_frame:end_frame]
 
         if len(clip) < int(sample_rate * MIN_SEGMENT_DURATION):
+            n_too_short += 1
             continue  # too short
 
         # Skip near-silent clips — the embedding model produces garbage
         # vectors from silence, which poison matching and profile updates.
+        # Log at INFO so a user-visible diagnostic appears in the meet
+        # job log when audio gain is too low.  See MIN_SEGMENT_RMS docstring.
         rms = float(np.sqrt(np.mean(clip ** 2)))
         if rms < MIN_SEGMENT_RMS:
-            log.debug(
-                "Skipping near-silent segment %.1f-%.1f (rms=%.6f)",
-                start, end, rms,
+            n_too_quiet += 1
+            log.info(
+                "Skipping near-silent segment %.1f-%.1f (rms=%.6f, floor=%.6f)",
+                start, end, rms, MIN_SEGMENT_RMS,
             )
             continue
 
@@ -234,6 +258,23 @@ def _embed_segments(
         except Exception as exc:
             log.debug("Embedding extraction failed for segment %.1f-%.1f: %s", start, end, exc)
             continue
+
+    # Per-speaker summary — surfaces silent-gate skips at WARNING when
+    # most segments were rejected, so auto-label failure has a visible
+    # cause rather than a silent "no confident matches".
+    if n_considered > 0 and n_too_quiet > 0:
+        ratio = n_too_quiet / n_considered
+        if ratio >= 0.8:
+            log.warning(
+                "Embedding: skipped %d/%d near-silent segments (floor=%.4f). "
+                "Increase mic gain at record time to improve auto-label match.",
+                n_too_quiet, n_considered, MIN_SEGMENT_RMS,
+            )
+        else:
+            log.info(
+                "Embedding: skipped %d/%d near-silent segments (floor=%.4f).",
+                n_too_quiet, n_considered, MIN_SEGMENT_RMS,
+            )
 
     if not embeddings:
         return None
