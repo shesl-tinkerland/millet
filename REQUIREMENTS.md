@@ -2,7 +2,14 @@
 
 > Part of [meetscribe](README.md) -- fully local meeting transcription.
 
-Everything runs locally. No cloud APIs, no data leaves your machine.
+The default configuration runs entirely on your machine: WhisperX +
+pyannote-audio for transcription and diarization, Ollama for AI
+summaries.  No cloud APIs needed for the local-first path.
+
+Cloud / TEE summary backends are **opt-in** alternatives (OpenRouter,
+Claude Max via local proxy, or DeepSeek V4 Pro inside a Tinfoil
+hardware-attested TEE).  See *Summary backends* and *Summarization
+presets* in the [README](README.md) for the trust model of each.
 
 ## Hardware
 

@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.8.1 — 2026-05-22
+
+### Fixes
+
+- **`apply_labels()` accepts `summary_preset` kwarg.**  `meet label`'s
+  CLI was passing `summary_preset=...` to `apply_labels()` since the
+  preset feature landed in 0.8.0, but the parameter wasn't in the
+  function signature.  Every `meet label --auto` that found a
+  confident voiceprint match crashed with `TypeError`.  The bug was
+  latent because the auto-label path itself was failing on the
+  `MIN_SEGMENT_RMS` regression below; with both fixed, the auto-label
+  contract works end-to-end.  Regression test added.
+- **Voiceprint matcher: lower per-segment RMS floor 0.005 → 0.0015.**
+  The 0.005 floor introduced as a silence guard turned out to be too
+  aggressive for real-world recordings with quiet mic gain
+  (mean ~-49 dBFS, peaks at -4 dBFS).  Per-segment RMS clustered in
+  [0.0016, 0.0024] — all silently skipped (`log.debug`) → no embedding
+  → no match → every session needed manual labeling against an already-
+  populated profile DB.  New floor at ~ -56 dBFS is well above true
+  silence (-90) but below the lowest validated mic-recording RMS.
+  Skip log promoted to `log.info`; a `log.warning` fires when ≥80% of
+  segments were skipped.
+- **Relabeled PDF preserves model attribution + backend.**
+  `apply_labels(regenerate_summary=False)` used to hardcode
+  `model="(relabeled)"` and lose the original `backend`, breaking the
+  CONFIDENTIAL watermark on relabel-driven PDF regeneration.  Now reads
+  `.summary.meta.json` and threads model + backend through.
+
+## v0.8.0 — 2026-05-22
+
+### New features
+
+- **Summarization preset selector** — `--summary-preset
+  {high-quality,confidential,alternative}` on `transcribe`, `run`,
+  `label`, `gui`, and `ingest`.  Resolves to a concrete
+  `(backend, model)` pair via `meet.summarize.SUMMARY_PRESETS`.  GUI
+  gains a preset dropdown above the Advanced panel.
+- **Tinfoil TEE backend** — `pip install 'meetscribe-offline[tee]'`
+  pulls in the `tinfoil` SDK.  Inference runs inside a hardware-
+  attested TEE (AMD SEV-SNP or Intel TDX); prompts are not visible to
+  the model provider or the cloud operator.  ~$0.009 per meeting,
+  ~66 s for a 30-min recording on DeepSeek V4 Pro.  Set
+  `TINFOIL_API_KEY` or drop a key file at `~/models/tinfoil/tinfoil.txt`.
+- **CONFIDENTIAL PDF watermark** — sessions summarized via the
+  `tinfoil` backend get a red CONFIDENTIAL watermark on every page
+  header and footer.  Auto-detected from `summary.backend`.
+
+### Behavior changes
+
+- **Preset guard semantics**: when a preset is explicitly chosen,
+  summarization failures are NOT silently absorbed into the fallback
+  chain.  A silent tinfoil → claudemax fallback would defeat the
+  entire point of the Confidential preset.  Preset failures now raise
+  `RuntimeError` from `summarize()`; the CLI catches it, finishes
+  writing the transcript artifact, then exits non-zero so downstream
+  tooling (vezir, CI) can detect the partial failure.
+- **Default Ollama model** changed from `gpt-oss:20b` to `qwen3.5:9b`
+  (better quality and no hallucinations on unseen transcripts).
+- **Fallback chain** now: `claudemax → tinfoil → openrouter → ollama`
+  (was `claudemax → openrouter → ollama`).
+- **PDF: strip trailing JSON block from summary body**, so the
+  rendered PDF shows clean Markdown rather than the structured data
+  block contract introduced in 0.7.0.
+
+### Internals
+
+- New `tee` optional-dependency group in `pyproject.toml`.
+- `SUMMARY_PRESETS` table at `meet/summarize.py:77`.
+- `_resolve_tinfoil_api_key()` helper reads from env var or fallback
+  file at `~/models/tinfoil/tinfoil.txt`.
+- PDF generator auto-enables `confidential=True` when
+  `summary.backend in ("tinfoil", "tinfoil-tee")`.
+
 ## v0.7.2 — 2026-05-17
 
 ### Fixes

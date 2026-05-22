@@ -9,7 +9,12 @@ summaries, and professional PDF output.
 Records dual-channel audio (your mic + system audio) from **any** meeting
 app and produces diarized transcripts using WhisperX + pyannote-audio.
 Works fully offline with local models, or optionally use cloud APIs
-(OpenRouter, Claude Max) for higher-quality summaries.
+(OpenRouter, Claude Max) for higher-quality summaries.  A
+**summarization preset selector** picks one of three backends per run:
+`high-quality` (Sonnet 4.6), `confidential` (DeepSeek V4 Pro inside a
+hardware-attested Tinfoil TEE — the prompts never leave the secure
+enclave, and the resulting PDF carries a red CONFIDENTIAL watermark on
+every page), or `alternative` (Kimi K2.6 via OpenRouter).
 
 ## Works with any meeting app
 
@@ -48,7 +53,17 @@ including browser-based meetings and standalone desktop clients.
 - **Speaker diarization** -- pyannote-audio identifies who said what, with
   automatic YOU/REMOTE labeling from the dual-channel signal
 - **AI meeting summaries** -- local LLMs via Ollama, or cloud APIs via
-  OpenRouter / Claude Max, with automatic fallback between backends
+  OpenRouter / Claude Max / Tinfoil TEE, with automatic fallback between
+  backends (preset-aware: when a preset is explicitly selected the
+  fallback is disabled so the chosen privacy/quality level is honored)
+- **Summarization presets** -- `--summary-preset high-quality |
+  confidential | alternative` resolves to a `(backend, model)` pair;
+  the `confidential` preset routes to a Tinfoil TEE-attested DeepSeek
+  V4 Pro so prompts cannot be seen by the model provider or cloud
+  operator
+- **CONFIDENTIAL PDF watermark** -- sessions summarized via the
+  `tinfoil` backend get a red CONFIDENTIAL header + footer on every
+  page (auto-detected from `summary.backend`, survives relabeling)
 - **Voiceprint speaker recognition** -- automatically identifies speakers
   across meetings using voice embedding profiles
 - **Meeting sync** -- push transcripts and summaries to any Git repository
@@ -127,13 +142,18 @@ sudo dnf install ffmpeg pulseaudio-utils
 # From PyPI (recommended)
 pip install meetscribe-offline
 
+# Optional: pull the Tinfoil TEE SDK to enable the Confidential preset
+pip install 'meetscribe-offline[tee]'
+
 # From source
 git clone https://github.com/pretyflaco/meetscribe
 cd meetscribe
 pip install -e .
 ```
 
-This creates the `meet` command in your PATH.
+This creates the `meet` command in your PATH.  The `[tee]` extra adds
+the `tinfoil` Python SDK (≈ 2 MB).  Set `TINFOIL_API_KEY` to use the
+`--summary-preset confidential` route; see *Summarization presets* below.
 
 ### 3. HuggingFace token (for speaker diarization)
 
@@ -423,17 +443,25 @@ meet run --no-summarize
 
 ### Summary backends
 
-meetscribe supports three backends with automatic fallback:
+meetscribe supports five backends with automatic fallback:
 
-| Backend | Setup | Cost | Quality |
-|---------|-------|------|---------|
-| `ollama` (default) | `ollama serve` + `ollama pull qwen3.5:9b` | Free | Good |
-| `openrouter` | Set `OPENROUTER_API_KEY` | Pay-per-use | Excellent |
-| `claudemax` | Run claude-max-api-proxy on localhost:3457 | Claude Max subscription | Excellent |
-| `openai` | Set `MEETSCRIBE_OPENAI_BASE_URL` | Varies | Varies |
+| Backend | Setup | Cost | Quality | Privacy |
+|---------|-------|------|---------|---------|
+| `ollama` (default) | `ollama serve` + `ollama pull qwen3.5:9b` | Free | Good | Fully local |
+| `openrouter` | Set `OPENROUTER_API_KEY` | Pay-per-use | Excellent | Cloud (model-provider-visible) |
+| `claudemax` | Run claude-max-api-proxy on localhost:3457 | Claude Max subscription | Excellent | Cloud (Anthropic-visible) |
+| `tinfoil` | `pip install 'meetscribe-offline[tee]'`, set `TINFOIL_API_KEY` (or drop a key file at `~/models/tinfoil/tinfoil.txt`) | ~$0.009/meeting | Excellent (DeepSeek V4 Pro) | **Hardware-attested TEE — prompts not visible to provider/operator** |
+| `openai` | Set `MEETSCRIBE_OPENAI_BASE_URL` | Varies | Varies | Depends on endpoint |
 
 The `openai` backend works with any OpenAI-compatible API — Lemonade, LiteLLM,
 vLLM, text-generation-webui, LocalAI, or any self-hosted endpoint.
+
+The `tinfoil` backend runs inference inside a hardware-attested TEE (AMD
+SEV-SNP or Intel TDX, depending on the model).  The model provider can't
+see the prompts, the cloud operator can't see the prompts, and the
+integrity is checked against an attestation report on every request.
+~$0.009 per meeting; latency ~66 s for a 30-min recording on DeepSeek
+V4 Pro.
 
 ```bash
 # Use OpenRouter
@@ -451,7 +479,41 @@ export MEETSCRIBE_SUMMARY_MODEL=anthropic/claude-sonnet-4.6
 ```
 
 If the configured backend is unavailable, meetscribe automatically tries the
-next one in the fallback chain: claudemax → openrouter → ollama.
+next one in the fallback chain: **claudemax → tinfoil → openrouter → ollama**.
+The `openai` backend is opt-in only and never participates in the fallback
+chain.
+
+When a preset is explicitly selected (see *Summarization presets* below),
+this fallback is **disabled** for that run — the chosen preset's backend
+either succeeds or the whole summarization step fails loudly with a
+non-zero exit.  This protects the privacy/quality promise of the
+`confidential` preset (a silent tinfoil → claudemax fallback would defeat
+the entire point of choosing TEE-attested inference).
+
+### Summarization presets
+
+A preset is a friendly name that resolves to a concrete `(backend, model)`
+pair.  Set it via `--summary-preset` on `transcribe`, `run`, `label`,
+`gui`, or `ingest`, or via the `MEETSCRIBE_SUMMARY_PRESET` env var.
+
+| Preset | Backend | Model | Use case |
+|---|---|---|---|
+| `high-quality` | `claudemax` | `claude-sonnet-4-6` | Default for users with a Claude Max subscription; highest summary quality |
+| `confidential` | `tinfoil` | `deepseek-v4-pro` | Meetings where prompts must not be retained or trained on; hardware-attested TEE |
+| `alternative` | `openrouter` | `moonshotai/kimi-k2.6` | Cheapest cloud option (~$0.017/meeting); useful when claudemax credentials are unavailable |
+
+```bash
+# Quick check of which preset is in effect
+meet transcribe ~/meet-recordings/today/today.wav --summary-preset confidential
+
+# Or set per-session via env
+export MEETSCRIBE_SUMMARY_PRESET=high-quality
+meet run
+```
+
+When a preset is set, `--summary-backend` and `--summary-model` overrides
+are honored within that preset (e.g. `--summary-preset confidential
+--summary-model deepseek-v3` swaps the model but keeps the TEE backend).
 
 ### Two-pass local summarization
 
