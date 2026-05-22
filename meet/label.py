@@ -329,6 +329,7 @@ def apply_labels(
     session_dir: str | Path,
     label_map: dict[str, str],
     regenerate_summary: bool = True,
+    summary_preset: str | None = None,
     summary_backend: str | None = None,
     summary_model: str | None = None,
     ollama_singlepass: bool = False,
@@ -347,6 +348,11 @@ def apply_labels(
         regenerate_summary: If True, re-run the LLM to generate a new summary
             with updated speaker names. If False, do a best-effort
             find-and-replace on the existing summary.
+        summary_preset: Optional summarization preset id
+            ("high-quality" | "confidential" | "alternative").  Forwarded
+            to SummaryConfig when regenerate_summary is True so the same
+            preset guard semantics apply during relabel-driven summary
+            regeneration as during the initial transcribe pass.
         summary_backend: Backend override ("ollama" or "openrouter"); None uses default.
         summary_model: Model name override; None uses the per-backend default.
         progress_callback: Optional callable(str) for status messages.
@@ -391,6 +397,8 @@ def apply_labels(
             from meet.transcribe import ensure_gpu_available
 
             cfg_kwargs: dict = {}
+            if summary_preset:
+                cfg_kwargs["preset"] = summary_preset
             if summary_backend:
                 cfg_kwargs["backend"] = summary_backend
             if summary_model:

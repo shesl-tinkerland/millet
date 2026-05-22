@@ -329,3 +329,20 @@ class TestApplyLabels:
         apply_labels(session_dir, {"YOU": "Alice"}, regenerate_summary=False)
         new_text = summary_path.read_text()
         assert "Alice discussed the meeting" in new_text
+
+    def test_accepts_summary_preset_kwarg(self, session_dir):
+        """Regression: cli.py `meet label` passes summary_preset= to
+        apply_labels().  If the kwarg isn't in the signature, every
+        auto-label call from `meet label --auto` raises TypeError and
+        the relabel never lands on disk.  See git history for context.
+
+        Validates the signature itself; runs with regenerate_summary=False
+        so the LLM path is bypassed and we don't need a live backend."""
+        apply_labels(
+            session_dir,
+            {"YOU": "Alice"},
+            regenerate_summary=False,
+            summary_preset="high-quality",
+        )
+        txt = (session_dir / "meeting-20260314-100000.txt").read_text()
+        assert "Alice:" in txt
