@@ -370,10 +370,22 @@ def _md_to_markup(text: str, rtl_wrap=None) -> str:
     return built
 
 
+def _strip_json_block(md: str) -> str:
+    """Remove trailing fenced JSON block from summary markdown.
+
+    The summary prompt asks models to append a ```json block after the
+    5 Markdown sections.  This block is consumed by frontmatter tooling
+    but should NOT appear in the PDF.
+    """
+    return re.sub(r"\n*```json\s*\n[\s\S]*?```\s*$", "", md, flags=re.DOTALL).rstrip()
+
+
 def _summary_to_flowables(
     summary_md: str, styles: dict, *, language: str = "en",
 ) -> list:
     """Convert the Markdown summary into ReportLab flowables."""
+    # Strip the structured JSON block before rendering
+    summary_md = _strip_json_block(summary_md)
     flowables: list = []
     lines = summary_md.split("\n")
     rtl = _is_rtl(language)
@@ -454,9 +466,11 @@ def _summary_to_flowables(
 class _PDFDocTemplate(BaseDocTemplate):
     """Custom doc template with header line and page-number footer."""
 
-    def __init__(self, filename, title: str = "", **kwargs):
+    def __init__(self, filename, title: str = "", *,
+                 confidential: bool = False, **kwargs):
         super().__init__(filename, **kwargs)
         self._pdf_title = title
+        self._confidential = confidential
 
         frame = Frame(
             _MARGIN_LEFT,
@@ -473,11 +487,26 @@ class _PDFDocTemplate(BaseDocTemplate):
         """Draw header line and footer on every page."""
         canvas.saveState()
 
-        # Footer: page number
+        # Footer: page number (+ CONFIDENTIAL if applicable)
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(_COLOR_TIMESTAMP)
         page_text = f"Page {doc.page}"
         canvas.drawCentredString(_PAGE_W / 2, _MARGIN_BOTTOM * 0.5, page_text)
+
+        if self._confidential:
+            canvas.setFont("Helvetica-Bold", 7)
+            canvas.setFillColor(HexColor("#cc0000"))
+            canvas.drawCentredString(
+                _PAGE_W / 2, _MARGIN_BOTTOM * 0.5 + 12, "CONFIDENTIAL"
+            )
+
+        # Header: CONFIDENTIAL banner (if applicable)
+        if self._confidential:
+            canvas.setFont("Helvetica-Bold", 7)
+            canvas.setFillColor(HexColor("#cc0000"))
+            canvas.drawCentredString(
+                _PAGE_W / 2, _PAGE_H - _MARGIN_TOP + 14, "CONFIDENTIAL"
+            )
 
         # Thin line at top of content area
         y_line = _PAGE_H - _MARGIN_TOP + 4
@@ -496,6 +525,7 @@ def generate_pdf(
     summary: "MeetingSummary | None" = None,
     title: str = "Meeting Transcript",
     language: str = "en",
+    confidential: bool = False,
 ) -> Path:
     """Generate a PDF transcript document.
 
@@ -507,6 +537,8 @@ def generate_pdf(
         title: Document title shown on the first page.
         language: Language code (e.g. "en", "de", "fa") for font and
             RTL selection.
+        confidential: If True, print "CONFIDENTIAL" in red on every
+            page header and footer (used for TEE-backed summaries).
 
     Returns:
         Path to the generated PDF file.
@@ -597,9 +629,17 @@ def generate_pdf(
         story.append(Paragraph(text, styles["transcript_text"]))
 
     # ── Build PDF ──
+    # Auto-detect confidential mode from summary backend
+    is_confidential = confidential
+    if not is_confidential and summary and getattr(summary, "backend", "") in (
+        "tinfoil", "tinfoil-tee",
+    ):
+        is_confidential = True
+
     doc = _PDFDocTemplate(
         str(output_path),
         title=title,
+        confidential=is_confidential,
         pagesize=letter,
         leftMargin=_MARGIN_LEFT,
         rightMargin=_MARGIN_RIGHT,
