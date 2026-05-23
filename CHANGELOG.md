@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.8.3 — 2026-05-23
+
+### Fixed
+
+- **`apply_labels()` now re-raises summary failures when `summary_preset`
+  is set.**  Previously, all summary exceptions were silently caught and
+  `regenerate_summary` was set to `False`, making it impossible for
+  callers to detect that the summary was not generated.  When
+  `summary_preset` is explicitly provided (e.g. by vezir's retry-summary
+  flow), the exception now propagates so the caller can surface it.
+  Callers that don't pass `summary_preset` (the default `meet label`
+  CLI flow) keep the existing silent-skip behavior.
+
 ## v0.8.2 — 2026-05-23
 
 ### Fixed

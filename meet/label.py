@@ -429,6 +429,13 @@ def apply_labels(
                 regenerate_summary = False
         except Exception as exc:
             _log(f"Summary regeneration failed: {exc}")
+            if summary_preset:
+                # Preset was explicitly requested — user chose a specific
+                # privacy/quality level.  Mirror the post_process() contract
+                # in transcribe.py: surface the failure as an exception so
+                # callers (vezir, automation) can react.  Standalone callers
+                # that don't pass summary_preset keep the silent-skip behavior.
+                raise
             regenerate_summary = False
 
     if not regenerate_summary and files.get("summary") and files["summary"].exists():
