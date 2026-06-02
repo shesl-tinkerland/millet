@@ -20,6 +20,8 @@ from millet.transcribe import (
     _consolidate_remote_clusters,
     _dominant_channel_language,
     _merge_orphan_system_segments,
+    _nearest_segment,
+    _segment_gap,
     _segments_total_seconds,
     _split_segment_by_word_speaker,
     _transcribe_asr,
@@ -1071,6 +1073,23 @@ class TestMergeOrphanSystemSegments:
         segs = [_seg(0, 0.5, None)]
         _merge_orphan_system_segments(segs, self._cfg())
         assert segs[0]["speaker"] is None
+
+
+class TestNearestSegment:
+    def test_empty_returns_none(self):
+        assert _nearest_segment([], 5.0) is None
+
+    def test_picks_nearest_by_gap(self):
+        a = {"start": 0, "end": 10, "speaker": "A"}
+        b = {"start": 50, "end": 60, "speaker": "B"}
+        assert _nearest_segment([a, b], 55.0)["speaker"] == "B"
+        assert _nearest_segment([a, b], 5.0)["speaker"] == "A"
+
+    def test_gap_zero_inside_span(self):
+        seg = {"start": 10, "end": 20}
+        assert _segment_gap(seg, 15.0) == 0.0
+        assert _segment_gap(seg, 25.0) == 5.0
+        assert _segment_gap(seg, 7.0) == 3.0
 
 
 class TestConsolidationConfig:

@@ -1167,6 +1167,33 @@ def _segments_total_seconds(segments: list) -> float:
     return float(sum(max(0.0, float(s["end"]) - float(s["start"])) for s in segments))
 
 
+def _segment_gap(segment, mid: float) -> float:
+    """Temporal gap (seconds) between time ``mid`` and a segment's span.
+
+    0.0 when ``mid`` falls inside ``[start, end]``; otherwise the distance to
+    the nearer edge.
+    """
+    start = float(segment["start"])
+    end = float(segment["end"])
+    if mid < start:
+        return start - mid
+    if mid > end:
+        return mid - end
+    return 0.0
+
+
+def _nearest_segment(segments: list, mid: float):
+    """Return the segment whose time span is temporally nearest ``mid``.
+
+    Returns ``None`` when ``segments`` is empty.  Defined at module scope (not
+    as a per-iteration closure) so it neither captures a loop variable nor
+    trips Ruff's late-binding guard (B023).
+    """
+    if not segments:
+        return None
+    return min(segments, key=lambda s: _segment_gap(s, mid))
+
+
 def _dominant_channel_language(
     mic_segments: list,
     sys_segments: list,
@@ -1369,15 +1396,9 @@ def _merge_orphan_system_segments(
         if dur > config.orphan_merge_max_seconds:
             continue
         mid = (float(seg["start"]) + float(seg["end"])) / 2.0
-        # Nearest assigned segment by temporal gap.
-        def _gap(a) -> float:
-            if mid < float(a["start"]):
-                return float(a["start"]) - mid
-            if mid > float(a["end"]):
-                return mid - float(a["end"])
-            return 0.0
-        nearest = min(assigned, key=_gap)
-        seg["speaker"] = nearest["speaker"]
+        nearest = _nearest_segment(assigned, mid)
+        if nearest is not None:
+            seg["speaker"] = nearest["speaker"]
 
 
 def _consolidate_dual_diarize_speakers(
@@ -1404,7 +1425,7 @@ def _consolidate_dual_diarize_speakers(
     try:
         inference = _vp._get_inference()
 
-        def embed_fn(speaker_id: str):  # noqa: ANN001 — closure
+        def embed_fn(speaker_id: str):
             segs = [
                 (float(s["start"]), float(s["end"]))
                 for s in sys_segments
