@@ -66,3 +66,55 @@ def test_global_config_still_works(home, tmp_path):
     )
     assert sync.is_sync_configured(config_path=cfg) is True
     assert cfg.exists()
+
+
+# ── CLI exit-code propagation (sync failure must not exit 0) ─────────────────
+
+
+def test_cli_sync_propagates_failure_exit_code(home, tmp_path, monkeypatch):
+    """A push/sync failure exits non-zero so callers (e.g. vezir) don't have
+    to scrape the log to notice a failed sync."""
+    from click.testing import CliRunner
+
+    from millet.cli.sync import sync as sync_cmd
+
+    sdir = tmp_path / "meeting-20260101-000000"
+    sdir.mkdir()
+
+    # cli/sync.py imports these from millet.sync inside the function, so patch
+    # the source module.
+    monkeypatch.setattr("millet.sync.is_sync_configured", lambda team=None: True)
+    from millet.sync import MeetingMatch
+    monkeypatch.setattr(
+        "millet.sync.detect_meeting_type",
+        lambda path, team=None: MeetingMatch(name="Dev Sync", folder="dev-sync"),
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("Command failed: git push")
+
+    monkeypatch.setattr("millet.sync.sync_session", _boom)
+
+    result = CliRunner().invoke(sync_cmd, [str(sdir)])
+    assert result.exit_code == 1
+    assert "Command failed: git push" in result.output
+
+
+def test_cli_sync_success_exits_zero(home, tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from millet.cli.sync import sync as sync_cmd
+    from millet.sync import MeetingMatch
+
+    sdir = tmp_path / "meeting-20260101-000000"
+    sdir.mkdir()
+    monkeypatch.setattr("millet.sync.is_sync_configured", lambda team=None: True)
+    monkeypatch.setattr(
+        "millet.sync.detect_meeting_type",
+        lambda path, team=None: MeetingMatch(name="Dev Sync", folder="dev-sync"),
+    )
+    monkeypatch.setattr(
+        "millet.sync.sync_session", lambda *a, **k: [tmp_path / "summary.md"]
+    )
+    result = CliRunner().invoke(sync_cmd, [str(sdir)])
+    assert result.exit_code == 0

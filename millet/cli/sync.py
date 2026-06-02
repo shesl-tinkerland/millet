@@ -127,6 +127,7 @@ def sync(session_dirs, force, meeting_type, list_schedule, init_config, team):
         )
         raise SystemExit(1)
 
+    had_error = False
     for session_dir in session_dirs:
         session_path = Path(session_dir)
         click.echo(f"Syncing: {session_path.name}")
@@ -157,5 +158,12 @@ def sync(session_dirs, force, meeting_type, list_schedule, init_config, team):
             )
             click.echo(f"  Done: {len(files)} file(s) pushed as {match.folder}/")
         except Exception as exc:
+            # A failure here (e.g. `git push` rejected) must NOT exit 0 — that
+            # made vezir rely on brittle log-string scraping to notice failed
+            # syncs.  Record it and propagate a non-zero exit after the loop.
             click.echo(f"  Error: {exc}", err=True)
+            had_error = True
         click.echo()
+
+    if had_error:
+        raise SystemExit(1)

@@ -16,6 +16,7 @@ from millet.transcribe import (
     Speaker,
     Transcript,
     TranscriptionConfig,
+    _apply_default_language_bias,
     _channel_correct_segments,
     _consolidate_remote_clusters,
     _dominant_channel_language,
@@ -1139,3 +1140,33 @@ class TestDominantChannelLanguage:
             [{"start": 0, "end": 5}, {"start": 10, "end": 12.5}]
         ) == 7.5
         assert _segments_total_seconds([]) == 0.0
+
+
+class TestDefaultLanguageBias:
+    def _cfg(self, **kw):
+        return TranscriptionConfig(
+            device="cpu",
+            default_language="en",
+            default_language_override_confidence=0.70,
+            **kw,
+        )
+
+    def test_low_confidence_minority_keeps_default(self):
+        # The real DEVSYNC regression: es detected at 0.50 -> keep en.
+        assert _apply_default_language_bias("es", 0.50, self._cfg()) == "en"
+
+    def test_high_confidence_minority_overrides_default(self):
+        assert _apply_default_language_bias("es", 0.85, self._cfg()) == "es"
+
+    def test_detected_equals_default(self):
+        assert _apply_default_language_bias("en", 0.40, self._cfg()) == "en"
+
+    def test_no_default_returns_detected(self):
+        cfg = TranscriptionConfig(device="cpu")  # default_language None
+        assert _apply_default_language_bias("es", 0.50, cfg) == "es"
+
+    def test_config_defaults(self):
+        cfg = TranscriptionConfig(device="cpu")
+        assert cfg.default_language is None
+        assert cfg.language_detection_segments == 6
+        assert cfg.default_language_override_confidence == 0.70

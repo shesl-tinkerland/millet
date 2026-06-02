@@ -178,6 +178,21 @@ from ._helpers import (
     "clusters into the dominant remote. Fixes phantom extra speakers. On by "
     "default; --no-consolidate-remote-clusters to disable.",
 )
+@click.option(
+    "--language-detection-segments",
+    type=int,
+    default=6,
+    help="When auto-detecting language (whisperx), sample this many windows "
+    "across each channel instead of only the first 30s (default: 6). Avoids "
+    "mislabeling a channel from a misleading opener.",
+)
+@click.option(
+    "--default-language",
+    default=None,
+    help="Soft team/operator default language (e.g. 'en'). When set and "
+    "language is auto, the default wins UNLESS a channel confidently detects "
+    "another language. Prevents drift for single-language teams.",
+)
 def transcribe(
     audio_file,
     model,
@@ -205,6 +220,8 @@ def transcribe(
     channel_correct,
     channel_correct_margin,
     consolidate_remote_clusters,
+    language_detection_segments,
+    default_language,
 ):
     """Transcribe a recorded audio file with speaker diarization."""
     from millet.transcribe import (
@@ -250,6 +267,8 @@ def transcribe(
         channel_correct=channel_correct,
         channel_correct_margin=channel_correct_margin,
         consolidate_remote_clusters=consolidate_remote_clusters,
+        language_detection_segments=language_detection_segments,
+        default_language=default_language,
     )
 
     if not no_diarize and not config.hf_token and mixdown != "dual":

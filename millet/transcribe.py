@@ -457,6 +457,20 @@ class TranscriptionConfig:
     hf_token: str | None = None
     min_speakers: int | None = None
     max_speakers: int | None = None
+    # ── Language auto-detection tuning ──
+    # whisperx detects the language from only the FIRST ~30s of each channel,
+    # which a misleading opener (e.g. a one-word "Gracias" / cross-talk) can
+    # skew — mislabeling an otherwise-English channel.  When language="auto"
+    # we instead sample several windows spread across the channel and take the
+    # most-confident majority.  Number of windows to sample (whisperx backend).
+    language_detection_segments: int = 6
+    # Soft team/operator default-language bias.  When set and language="auto",
+    # the default wins UNLESS a channel confidently detects another language
+    # (>= default_language_override_confidence).  Prevents drift to a
+    # low-confidence minority detection for a team that meets in one language.
+    default_language: str | None = None
+    # Confidence a non-default detection must clear to override default_language.
+    default_language_override_confidence: float = 0.70
     # Whether to use the dual-channel layout to improve diarization:
     # If True, the mic channel is labeled as SPEAKER_YOU and the system
     # channel helps confirm remote speaker segments.
@@ -1056,10 +1070,16 @@ def _transcribe_dual_channel(
             mic_audio, config, whisper_lang, whisperx_model=asr_model
         )
 
-        # Resolve language from the mic transcription result
-        mic_lang = mic_result.get("language", whisper_lang or "en")
+        # Resolve mic language (multi-window detection on whisperx auto).
+        mic_conf = 0.0
+        if config.language == "auto" and config.asr_backend == "whisperx":
+            mic_lang, mic_conf = _detect_language_multiwindow(
+                asr_model, mic_audio, config
+            )
+        else:
+            mic_lang = mic_result.get("language", whisper_lang or "en")
         if config.language == "auto":
-            print(f"  Detected mic language: {mic_lang}")
+            print(f"  Detected mic language: {mic_lang} ({mic_conf:.2f})")
 
         # ── Transcribe system channel ──
         print("  Transcribing system channel (right)...")
@@ -1071,9 +1091,15 @@ def _transcribe_dual_channel(
         sys_result = _transcribe_asr(
             sys_audio, config, whisper_lang, whisperx_model=asr_model
         )
-        sys_lang = sys_result.get("language", whisper_lang or "en")
+        sys_conf = 0.0
+        if config.language == "auto" and config.asr_backend == "whisperx":
+            sys_lang, sys_conf = _detect_language_multiwindow(
+                asr_model, sys_audio, config
+            )
+        else:
+            sys_lang = sys_result.get("language", whisper_lang or "en")
         if config.language == "auto":
-            print(f"  Detected system language: {sys_lang}")
+            print(f"  Detected system language: {sys_lang} ({sys_conf:.2f})")
 
         if asr_model is not None:
             del asr_model
@@ -1092,6 +1118,10 @@ def _transcribe_dual_channel(
             sys_lang,
         )
         if config.language == "auto":
+            dominant_conf = sys_conf if detected_language == sys_lang else mic_conf
+            detected_language = _apply_default_language_bias(
+                detected_language, dominant_conf, config
+            )
             print(f"  Summary/transcript language: {detected_language}")
 
         # ── Align each channel with its OWN detected language ──
@@ -1192,6 +1222,60 @@ def _nearest_segment(segments: list, mid: float):
     if not segments:
         return None
     return min(segments, key=lambda s: _segment_gap(s, mid))
+
+
+def _detect_language_multiwindow(
+    model, audio, config: TranscriptionConfig
+) -> tuple[str, float]:
+    """Detect language by sampling several windows across the audio.
+
+    whisperx labels a channel from only the first ~30s, which a misleading
+    opener can skew.  This asks the underlying faster-whisper model to sample
+    ``config.language_detection_segments`` windows and returns
+    ``(language, confidence)``.  Falls back to ``("en", 0.0)`` if the model
+    doesn't expose ``detect_language`` (older whisperx) or detection fails.
+    """
+    fw = getattr(model, "model", None)
+    detect = getattr(fw, "detect_language", None)
+    if detect is None:
+        return ("en", 0.0)
+    try:
+        lang, prob, _all = detect(
+            audio,
+            vad_filter=True,
+            language_detection_segments=max(1, config.language_detection_segments),
+        )
+        return (lang, float(prob))
+    except Exception as exc:  # pragma: no cover - backend variance
+        print(f"  Warning: multi-window language detection failed ({exc})")
+        return ("en", 0.0)
+
+
+def _apply_default_language_bias(
+    detected_lang: str,
+    detected_conf: float,
+    config: TranscriptionConfig,
+) -> str:
+    """Soft team/operator default-language bias.
+
+    When ``config.default_language`` is set, it wins UNLESS the detected
+    language differs from it AND the detection cleared
+    ``config.default_language_override_confidence``.  Prevents drift to a
+    low-confidence minority detection for a team that meets in one language.
+    """
+    default = config.default_language
+    if not default:
+        return detected_lang
+    if detected_lang == default:
+        return detected_lang
+    if detected_conf >= config.default_language_override_confidence:
+        return detected_lang
+    print(
+        f"  Language: keeping default '{default}' over low-confidence "
+        f"'{detected_lang}' ({detected_conf:.2f} < "
+        f"{config.default_language_override_confidence:.2f})"
+    )
+    return default
 
 
 def _dominant_channel_language(
@@ -1515,9 +1599,18 @@ def _transcribe_dual_diarize(
             mic_audio, config, whisper_lang, whisperx_model=asr_model
         )
 
-        mic_lang = mic_result.get("language", whisper_lang or "en")
+        # Robust per-channel language: prefer multi-window detection over
+        # whisperx's first-30s guess when auto-detecting on the whisperx
+        # backend.  Confidence is used for the default-language bias below.
+        mic_conf = 0.0
+        if config.language == "auto" and config.asr_backend == "whisperx":
+            mic_lang, mic_conf = _detect_language_multiwindow(
+                asr_model, mic_audio, config
+            )
+        else:
+            mic_lang = mic_result.get("language", whisper_lang or "en")
         if config.language == "auto":
-            print(f"  Detected mic language: {mic_lang}")
+            print(f"  Detected mic language: {mic_lang} ({mic_conf:.2f})")
 
         # ── Transcribe system channel (remotes) ──
         print("  Transcribing system channel (right / remotes)...")
@@ -1529,9 +1622,15 @@ def _transcribe_dual_diarize(
         sys_result = _transcribe_asr(
             sys_audio, config, whisper_lang, whisperx_model=asr_model
         )
-        sys_lang = sys_result.get("language", whisper_lang or "en")
+        sys_conf = 0.0
+        if config.language == "auto" and config.asr_backend == "whisperx":
+            sys_lang, sys_conf = _detect_language_multiwindow(
+                asr_model, sys_audio, config
+            )
+        else:
+            sys_lang = sys_result.get("language", whisper_lang or "en")
         if config.language == "auto":
-            print(f"  Detected system language: {sys_lang}")
+            print(f"  Detected system language: {sys_lang} ({sys_conf:.2f})")
 
         if asr_model is not None:
             del asr_model
@@ -1549,7 +1648,13 @@ def _transcribe_dual_diarize(
             mic_lang,
             sys_lang,
         )
+        # Soft default-language bias: keep the team default unless the chosen
+        # language was detected with high confidence.
         if config.language == "auto":
+            dominant_conf = sys_conf if detected_language == sys_lang else mic_conf
+            detected_language = _apply_default_language_bias(
+                detected_language, dominant_conf, config
+            )
             print(f"  Summary/transcript language: {detected_language}")
 
         # ── Align each channel with its OWN detected language ──
@@ -1727,8 +1832,15 @@ def transcribe(
 
         result = _transcribe_asr(audio, config, whisper_lang)
 
-        # Resolve the actual language (important when auto-detecting).
+        # Resolve the actual language (important when auto-detecting).  The
+        # mono mixdown blends both channels, so the first-30s detection is less
+        # skewed than a single channel; we keep it but still honor a team
+        # default-language bias when detection is unavailable/low-confidence.
+        # (Confidence isn't surfaced on the mono result, so the bias only
+        # applies if detection returned the default already or is missing.)
         detected_language = result.get("language", whisper_lang or "en")
+        if config.language == "auto" and config.default_language and not detected_language:
+            detected_language = config.default_language
         if config.language == "auto":
             print(f"  Detected language: {detected_language}")
 
