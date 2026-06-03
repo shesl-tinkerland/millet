@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.5 — Title-aware schedule matching + collision guard for sync
+
+### Fixed
+
+* **Title-aware schedule matching.**  `detect_meeting_type` now considers the
+  session `title` (when present in `*.session.json`).  A *titled* session only
+  auto-matches a scheduled meeting whose `name`/`folder` slug equals the
+  title's slug; otherwise it returns `None` so the caller files it under its
+  own folder.  This stops an ad-hoc meeting recorded *inside* a schedule
+  window (e.g. a "post-scrum" at 09:03 inside the 06:30–09:30 standup window)
+  from being misfiled as the scheduled meeting.  **Untitled sessions keep the
+  prior pure time-window behavior** (back-compat — existing scheduled-meeting
+  workflows are unchanged).
+
+* **Collision guard: never silently overwrite a different meeting.**
+  `sync_session` writes a small local-only `.session-id` marker into each
+  synced folder and, before reusing a dated folder, checks it.  If an existing
+  folder belongs to a *different* session, the new meeting is filed into a
+  disambiguated folder (`<folder>-<sessionid-suffix>`) instead of clobbering
+  the existing one.  Previously two meetings that resolved to the same folder
+  (e.g. two ad-hoc meetings in one schedule window) overwrote each other.
+
+### Notes
+
+* The `.session-id` marker is kept strictly local: it is registered in the
+  clone's `.git/info/exclude`, so it is never committed/pushed and never trips
+  the "uncommitted changes" sync guard.
+* Pairs with vezir v0.7.16, which injects the session `title` into
+  `*.session.json` (so the title-aware matching above can engage) and adds an
+  explicit "sync as" folder override.
+
 ## v0.12.1 — Fix auto-label discarding matches in non-interactive runs
 
 ### Fixed

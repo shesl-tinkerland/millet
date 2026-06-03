@@ -26,6 +26,69 @@ log = logging.getLogger(__name__)
 SYNC_CONFIG_PATH = Path.home() / ".config" / "meet" / "sync_config.json"
 CLONE_BASE_DIR = Path.home() / ".local" / "share" / "meet"
 MEETINGS_SUBDIR = "meetings"
+# Marker file written into each synced meeting folder recording which session
+# produced it.  Used by the collision guard to detect when a different session
+# would overwrite an existing folder.  Not pushed as a meeting artifact.
+SESSION_ID_MARKER = ".session-id"
+
+
+def _session_id_for(session_dir: Path) -> str | None:
+    """Best-effort session id for a session directory.
+
+    Prefers ``session_id`` from ``*.session.json`` (vezir injects it), then
+    falls back to the directory name (a bare ULID for vezir sessions).
+    """
+    sj = _find_session_json(session_dir)
+    if sj is not None:
+        try:
+            data = json.loads(sj.read_text(encoding="utf-8"))
+            sid = (data.get("session_id") or "").strip()
+            if sid:
+                return sid
+        except Exception:
+            pass
+    name = session_dir.name
+    return name or None
+
+
+def _resolve_target_dir(base_dir: Path, session_id: str | None, log_fn) -> Path:
+    """Return the folder to sync into, avoiding clobbering a different session.
+
+    If ``base_dir`` doesn't exist, or it already belongs to ``session_id``
+    (matching ``.session-id`` marker), use it as-is.  Otherwise append a short
+    suffix derived from the session id (``base_dir-<suffix>``) so two distinct
+    meetings that resolve to the same folder coexist instead of overwriting.
+    """
+    if not base_dir.exists():
+        return base_dir
+    marker = base_dir / SESSION_ID_MARKER
+    if session_id and marker.exists():
+        try:
+            if marker.read_text(encoding="utf-8").strip() == session_id:
+                return base_dir  # same session re-syncing — overwrite is fine
+        except Exception:
+            pass
+    # An existing folder with no marker, or a marker for a DIFFERENT session.
+    if not session_id:
+        return base_dir
+    suffix = session_id[-6:]
+    candidate = base_dir.parent / f"{base_dir.name}-{suffix}"
+    # If that exact disambiguated folder is already ours, reuse it.
+    cand_marker = candidate / SESSION_ID_MARKER
+    if candidate.exists() and cand_marker.exists():
+        try:
+            if cand_marker.read_text(encoding="utf-8").strip() == session_id:
+                return candidate
+        except Exception:
+            pass
+    if candidate.exists():
+        # Extremely unlikely collision on the suffix; fall back to a longer one.
+        candidate = base_dir.parent / f"{base_dir.name}-{session_id[-12:]}"
+    log_fn(
+        f"  Note: {base_dir.name}/ already holds a different meeting; "
+        f"using {candidate.name}/ to avoid overwriting it."
+    )
+    return candidate
 
 
 def _resolve_sync_config_path(
@@ -208,12 +271,30 @@ def check_sync_candidate(
     return SyncCandidate(match=match, team_members_found=found)
 
 
+def _meeting_slug(text: str) -> str:
+    """Lowercase hyphen-slug for comparing a title against a schedule folder.
+
+    "Dev Standup Daily" -> "dev-standup-daily"; "post-scrum" -> "post-scrum".
+    """
+    import re as _re
+    slug = _re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug
+
+
 def detect_meeting_type(
     session_dir: Path, team: str | None = None
 ) -> MeetingMatch | None:
     """Check if a session matches any configured scheduled meeting.
 
-    Reads started_at from session.json and compares against the schedule.
+    Reads ``started_at`` (and optionally ``title``) from session.json and
+    compares against the schedule.
+
+    Title-aware matching: a session that carries a non-empty ``title`` only
+    auto-matches a scheduled meeting whose name/folder slug equals the title's
+    slug.  This stops an ad-hoc meeting recorded *during* a schedule window
+    (e.g. a "post-scrum" at 09:03, inside the 06:30-09:30 standup window) from
+    being misfiled as that scheduled meeting.  Untitled sessions keep the
+    pure time-window behavior (back-compat).
 
     Returns a MeetingMatch if matched, None otherwise.
     """
@@ -226,6 +307,8 @@ def detect_meeting_type(
         started_at_str = meta.get("started_at")
         if not started_at_str:
             return None
+        title = (meta.get("title") or "").strip()
+        title_slug = _meeting_slug(title) if title else ""
         # Parse ISO format — may or may not have timezone info
         started_at = datetime.fromisoformat(started_at_str)
         # Treat naive datetimes as local time, convert to UTC
@@ -252,8 +335,24 @@ def detect_meeting_type(
             continue
         scheduled_minutes = m["hour_utc"] * 60
         window = m.get("window_minutes", 60)
-        if abs(meeting_minutes - scheduled_minutes) <= window:
-            return MeetingMatch(name=m["name"], folder=m["folder"])
+        if abs(meeting_minutes - scheduled_minutes) > window:
+            continue
+        # Title-aware guard: a titled session only matches a schedule whose
+        # name/folder slug equals the title's slug.  An ad-hoc titled meeting
+        # in the window does NOT inherit the scheduled folder.
+        if title_slug:
+            sched_slugs = {
+                _meeting_slug(m.get("folder", "")),
+                _meeting_slug(m.get("name", "")),
+            }
+            if title_slug not in sched_slugs:
+                log.debug(
+                    "session title '%s' (slug '%s') in window of '%s' but "
+                    "does not match its slug; not auto-filing as scheduled",
+                    title, title_slug, m.get("folder"),
+                )
+                continue
+        return MeetingMatch(name=m["name"], folder=m["folder"])
 
     return None
 
@@ -379,6 +478,33 @@ def _get_clone_dir(team: str | None = None) -> Path:
     return _clone_dir_for(repo_url, team)
 
 
+def _ensure_local_gitignore(clone_dir: Path) -> None:
+    """Add the collision marker to the clone's local-only ignore list.
+
+    Writes ``.session-id`` into ``<clone>/.git/info/exclude`` rather than a
+    tracked ``.gitignore`` so the markers stay strictly local: they are never
+    committed/pushed and never show up in ``git status --porcelain`` (which
+    would otherwise trip the uncommitted-changes guard).  Idempotent.
+    """
+    exclude = clone_dir / ".git" / "info" / "exclude"
+    try:
+        if exclude.exists():
+            existing = exclude.read_text(encoding="utf-8")
+            lines = {ln.strip() for ln in existing.splitlines()}
+            if SESSION_ID_MARKER in lines:
+                return
+            sep = "" if existing.endswith("\n") or not existing else "\n"
+            exclude.write_text(
+                f"{existing}{sep}{SESSION_ID_MARKER}\n", encoding="utf-8"
+            )
+        else:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text(f"{SESSION_ID_MARKER}\n", encoding="utf-8")
+    except Exception as exc:
+        # Non-fatal: worst case the marker shows as untracked.  Log and move on.
+        log.debug("Could not update local gitignore at %s: %s", exclude, exc)
+
+
 def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
     """Ensure the configured repo is cloned locally. Clone if not present, pull if it is.
 
@@ -406,7 +532,13 @@ def ensure_repo_cloned(progress_callback=None, team: str | None = None) -> Path:
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         _run_network(["git", "clone", repo_url, str(clone_dir)])
         _log("Clone complete.")
+        # New clone: register the local-only ignore for collision markers.
+        _ensure_local_gitignore(clone_dir)
     else:
+        # Keep the local-only collision markers out of git's sight so they
+        # neither get committed nor trip the uncommitted-changes guard.
+        _ensure_local_gitignore(clone_dir)
+
         status = _run(["git", "status", "--porcelain"], cwd=clone_dir)
         if status.stdout.strip():
             raise RuntimeError(
@@ -553,9 +685,17 @@ def sync_session(
     repo = ensure_repo_cloned(progress_callback=progress_callback, team=team)
 
     date_str = _date_from_session(session_dir)
-    # Each meeting gets its own folder: date first so folders sort chronologically
-    target_dir = repo / MEETINGS_SUBDIR / f"{date_str}_{meeting_type.folder}"
+    session_id = _session_id_for(session_dir)
+    # Each meeting gets its own folder: date first so folders sort chronologically.
+    # Collision guard: if a folder for this date+type already holds a DIFFERENT
+    # session, don't overwrite it — disambiguate with a short suffix.  Prevents
+    # two meetings that resolve to the same folder (e.g. two ad-hoc meetings in
+    # one schedule window) from clobbering each other.
+    base_dir = repo / MEETINGS_SUBDIR / f"{date_str}_{meeting_type.folder}"
+    target_dir = _resolve_target_dir(base_dir, session_id, _log)
     target_dir.mkdir(parents=True, exist_ok=True)
+    if session_id:
+        (target_dir / SESSION_ID_MARKER).write_text(session_id + "\n", encoding="utf-8")
 
     # Ensure README exists
     _ensure_readme(repo / MEETINGS_SUBDIR, team=team)
