@@ -31,6 +31,65 @@
   `*.session.json` (so the title-aware matching above can engage) and adds an
   explicit "sync as" folder override.
 
+## v0.12.4 — Robust language detection + sync exit-code
+
+### Changed
+
+* **Multi-window language detection.**  whisperx detected language from only
+  the first ~30 s of each channel, so a misleading opener (e.g. an opening
+  "Gracias") mislabeled an English meeting as Spanish even after the
+  dominant-channel fix.  Now samples N windows across each channel via
+  faster-whisper's `detect_language(language_detection_segments=N)`
+  (whisperx backend; `--language-detection-segments`, default 6).
+* **Soft default-language bias.**  `--default-language <lang>` keeps the team
+  default unless a channel confidently detects another language
+  (≥ `default_language_override_confidence`, default 0.70); fed into
+  dominant-channel selection.
+
+### Fixed
+
+* **`millet sync` exit code.**  `cli/sync.py` now raises `SystemExit(1)` when
+  any session fails (e.g. git push rejected) instead of exiting 0 — callers
+  no longer have to scrape the log to notice a failed sync.
+
+## v0.12.3 — Summary language from the dominant channel + per-language summaries
+
+### Fixed
+
+* **Summary/transcript language now follows the channel with the most
+  speech** (`_dominant_channel_language`; mic wins exact ties).  Previously
+  the dual-channel paths took the language from the mic channel only, so a
+  local speaker's minority-language asides made the whole summary that
+  language.  Each channel is also word-aligned with its OWN detected language
+  (`_align_channel`) instead of sharing the mic's model.
+
+### Added
+
+* `apply_labels` gains `summary_language`: regenerate the summary in a chosen
+  language and save it as an ADDITIONAL `<base>.summary.<lang>.md` (with
+  suffixed meta/frontmatter sidecars), preserving the primary auto-detected
+  summary.  `MeetingSummary.save` gains `lang_suffix`.
+* `sync`: `<base>.summary.<lang>.md` syncs as a distinct `summary.<lang>.md`;
+  `.frontmatter.json` is excluded (also fixes a latent collision).
+
+## v0.12.2 — Suppress phantom remote speakers in dual-diarize
+
+### Fixed
+
+* pyannote can over-segment a single remote stream into multiple clusters
+  (peeling short backchannel "yeah/cool" off the main speaker into a
+  phantom), which voiceprint matching then mis-named from a weak,
+  barely-over-threshold match.
+  * **Voiceprint auto-apply gate**: a match at/above `MATCH_THRESHOLD` is
+    applied only if it has enough embeddable speech AND is unambiguous
+    (strong absolute confidence OR a clear margin over the runner-up).
+    `SpeakerMatch` gains `evidence_seconds` + `margin`; weak/ambiguous
+    matches stay raw and route to `needs_labeling` instead of confidently
+    mislabeling.  The sidecar records only applied matches.
+  * **Remote-cluster consolidation** (dual-diarize): merge same-speaker
+    clusters (cosine ≥ `cluster_merge_similarity`) and absorb thin clusters
+    (< `cluster_min_speech_seconds`) into the dominant remote.
+
 ## v0.12.1 — Fix auto-label discarding matches in non-interactive runs
 
 ### Fixed
