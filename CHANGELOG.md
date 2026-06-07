@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.12.6 — Fix in-room multi-speaker collapse in the dual-diarize path
+
+### Fixed
+
+* **Multiple in-room speakers on the mic channel collapsed into one.**  The
+  default `dual-diarize` path assumes the mic (left) channel carries a single
+  local speaker (labeled `YOU`) and only diarizes the system (right) channel.
+  For an **in-room recording** — several people sharing one mic, with the
+  system channel silent or merely a duplicate of the mic — every mic speaker
+  was therefore merged into a single speaker.  The pipeline now detects this
+  single-source case and falls back to the mono path (mix down + diarize the
+  combined signal), which splits the in-room speakers correctly.  Genuine
+  remote calls (an active, distinct system channel) are unaffected and keep
+  using `dual-diarize`.
+
+### Added
+
+* `--single-source-fallback` / `--no-single-source-fallback` (default on) and
+  `TranscriptionConfig.single_source_fallback`.  Detection thresholds are
+  tunable via `system_inactive_rms_ratio` (default 0.10) and
+  `channel_duplicate_corr` (default 0.98).  New helpers
+  `_is_single_source_stereo` + `_load_stereo_int16`.
+
+### Notes
+
+* Single-source is detected when the system channel's active-sample RMS is
+  below `system_inactive_rms_ratio` of the mic channel's, OR the two channels'
+  Pearson correlation is at/above `channel_duplicate_corr`.  Conservative on
+  analysis failure (keeps `dual-diarize`), so remote calls are never
+  mis-routed.
+
 ## v0.12.5 — Title-aware schedule matching + collision guard for sync
 
 ### Fixed

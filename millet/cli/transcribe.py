@@ -179,6 +179,14 @@ from ._helpers import (
     "default; --no-consolidate-remote-clusters to disable.",
 )
 @click.option(
+    "--single-source-fallback/--no-single-source-fallback",
+    default=True,
+    help="In the dual-diarize path, detect single-source stereo (system "
+    "channel silent, or a duplicate of the mic — i.e. an in-room recording) "
+    "and fall back to mono diarization so multiple in-room speakers on the "
+    "mic channel are split instead of collapsing into one. On by default.",
+)
+@click.option(
     "--language-detection-segments",
     type=int,
     default=6,
@@ -220,6 +228,7 @@ def transcribe(
     channel_correct,
     channel_correct_margin,
     consolidate_remote_clusters,
+    single_source_fallback,
     language_detection_segments,
     default_language,
 ):
@@ -267,6 +276,7 @@ def transcribe(
         channel_correct=channel_correct,
         channel_correct_margin=channel_correct_margin,
         consolidate_remote_clusters=consolidate_remote_clusters,
+        single_source_fallback=single_source_fallback,
         language_detection_segments=language_detection_segments,
         default_language=default_language,
     )

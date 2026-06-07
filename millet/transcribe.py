@@ -537,6 +537,23 @@ class TranscriptionConfig:
     # remote cluster when shorter than this many seconds.
     orphan_merge_max_seconds: float = 1.0
 
+    # ── Single-source detection (dual-diarize path) ──
+    # The dual-diarize path assumes the mic (left) channel carries exactly one
+    # local speaker and only diarizes the system (right) channel.  That is
+    # wrong for an in-room recording where multiple people share the mic and
+    # the system channel is silent (or merely a copy of the mic): every mic
+    # speaker would collapse into a single "YOU".  When the system channel is
+    # inactive OR the two channels are near-duplicates, fall back to the mono
+    # path (mix down + diarize the combined signal), which splits the in-room
+    # speakers correctly.  Enable/disable via --[no-]single-source-fallback.
+    single_source_fallback: bool = True
+    # System (right) channel is considered inactive when its active-sample RMS
+    # is below this fraction of the mic (left) channel's active-sample RMS.
+    system_inactive_rms_ratio: float = 0.10
+    # The two channels are considered near-duplicate (in-room dual-mono) when
+    # their Pearson correlation is at or above this threshold.
+    channel_duplicate_corr: float = 0.98
+
     # Internal: set to True by __post_init__ when `device` was auto-flipped
     # to 'cpu' because the requested accelerator was unavailable.  Used to
     # produce an honest annotation in the model-load log line — distinguishes
@@ -759,6 +776,86 @@ def _extract_mono(audio_file: Path, channel: int = 0) -> Path:
     if result.returncode != 0:
         raise RuntimeError(f"Failed to extract channel {channel}: {result.stderr}") from None
     return Path(tmp.name)
+
+
+def _load_stereo_int16(audio_file: Path):
+    """Decode a stereo file to (left, right) int16 numpy arrays via ffmpeg.
+
+    Returns ``(left, right)`` float32 arrays, or ``None`` if decoding fails or
+    numpy is unavailable.  Works for any ffmpeg-readable format (wav, ogg, …).
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(audio_file),
+        "-ac", "2", "-ar", "16000", "-f", "s16le", "-c:a", "pcm_s16le", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+    except Exception:
+        return None
+    if result.returncode != 0 or not result.stdout:
+        return None
+    data = np.frombuffer(result.stdout, dtype=np.int16)
+    if data.size < 2:
+        return None
+    data = data[: (data.size // 2) * 2].reshape(-1, 2).astype(np.float32)
+    return data[:, 0], data[:, 1]
+
+
+def _is_single_source_stereo(audio_file: Path, config) -> bool:
+    """True if a stereo recording is effectively single-source.
+
+    Two cases the dual-diarize path mishandles (it labels the whole mic
+    channel as one "YOU" speaker):
+
+    * **System (right) channel inactive** — its active-sample RMS is below
+      ``system_inactive_rms_ratio`` of the mic channel's (an in-room
+      recording: everyone is on the mic, nothing on system audio).
+    * **Channels near-duplicate** — Pearson correlation >=
+      ``channel_duplicate_corr`` (dual-mono: the same mixed signal on both
+      channels, so the "system" channel adds no separate speaker).
+
+    In either case the caller should fall back to the mono path so the
+    combined-signal diarization can split multiple in-room speakers.
+
+    Conservative on failure: returns False (keep dual-diarize) if the audio
+    can't be analyzed, so genuine remote calls are never mis-routed.
+    """
+    chans = _load_stereo_int16(audio_file)
+    if chans is None:
+        return False
+    try:
+        import numpy as np
+    except ImportError:
+        return False
+    left, right = chans
+
+    # ── System-channel inactivity (per-channel active-sample RMS) ──
+    silence_thr = 50.0  # ~-50 dBFS for 16-bit (matches _mixdown_to_mono)
+    left_active = left[np.abs(left) > silence_thr]
+    right_active = right[np.abs(right) > silence_thr]
+    left_rms = float(np.sqrt(np.mean(left_active**2))) if left_active.size else 0.0
+    right_rms = float(np.sqrt(np.mean(right_active**2))) if right_active.size else 0.0
+    if left_rms > 0.0:
+        if right_rms <= config.system_inactive_rms_ratio * left_rms:
+            return True
+    elif right_rms <= 0.0:
+        # Both channels silent — nothing to diarize per-channel; mono is fine.
+        return True
+
+    # ── Near-duplicate channels (Pearson correlation) ──
+    n = min(left.size, right.size)
+    if n >= 16000:  # at least ~1 s at 16 kHz before trusting correlation
+        a = left[:n]
+        b = right[:n]
+        if a.std() > 1e-6 and b.std() > 1e-6:
+            corr = float(np.corrcoef(a, b)[0, 1])
+            if corr >= config.channel_duplicate_corr:
+                return True
+    return False
 
 
 def _mixdown_to_mono(audio_file: Path) -> Path:
@@ -1803,8 +1900,21 @@ def transcribe(
         )
 
     if is_stereo and config.use_dual_channel and config.mixdown == "dual-diarize":
-        print("  Dual-channel detected: transcribing channels separately + diarizing remotes")
-        return _transcribe_dual_diarize(audio_path, config, duration)
+        # The dual-diarize path treats the mic channel as a single local
+        # speaker.  For an in-room recording (multiple people share the mic,
+        # system channel silent or a duplicate of the mic) that collapses
+        # everyone into one speaker — fall back to the mono path, which
+        # diarizes the combined signal and splits the in-room speakers.
+        if config.single_source_fallback and _is_single_source_stereo(
+            audio_path, config
+        ):
+            print(
+                "  Single-source stereo detected (system channel inactive or "
+                "duplicate) — using mono diarization to split in-room speakers"
+            )
+        else:
+            print("  Dual-channel detected: transcribing channels separately + diarizing remotes")
+            return _transcribe_dual_diarize(audio_path, config, duration)
 
     if is_stereo and config.use_dual_channel and config.mixdown == "dual":
         print("  Dual-channel detected: transcribing channels separately")

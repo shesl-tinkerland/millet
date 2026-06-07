@@ -802,6 +802,118 @@ class TestDualChannelDispatch:
             mock_dual.assert_not_called()
 
 
+def _write_stereo_lr(path, left, right, sr=16000):
+    """Write a stereo WAV from explicit left/right int16 arrays."""
+    import wave
+    n = min(len(left), len(right))
+    stereo = np.column_stack(
+        (
+            np.clip(left[:n], -32768, 32767).astype(np.int16),
+            np.clip(right[:n], -32768, 32767).astype(np.int16),
+        )
+    ).flatten()
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(stereo.tobytes())
+    return path
+
+
+class TestSingleSourceStereo:
+    """Detect in-room recordings (single source) so the dual-diarize path
+    falls back to mono diarization instead of collapsing the mic channel."""
+
+    def _t(self, dur=3.0, sr=16000):
+        return np.arange(int(dur * sr), dtype=np.float32) / sr
+
+    def test_silent_system_channel_is_single_source(self, tmp_path):
+        from millet.transcribe import _is_single_source_stereo
+        t = self._t()
+        left = (16000 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+        right = np.zeros_like(left)  # system channel silent (in-room)
+        wav = _write_stereo_lr(tmp_path / "silent-sys.wav", left, right)
+        assert _is_single_source_stereo(wav, TranscriptionConfig()) is True
+
+    def test_duplicate_channels_are_single_source(self, tmp_path):
+        from millet.transcribe import _is_single_source_stereo
+        t = self._t()
+        # Both channels carry the same mixed signal (dual-mono).
+        sig = (12000 * np.sin(2 * np.pi * 200 * t)
+               + 8000 * np.sin(2 * np.pi * 330 * t)).astype(np.int16)
+        wav = _write_stereo_lr(tmp_path / "dual-mono.wav", sig, sig.copy())
+        assert _is_single_source_stereo(wav, TranscriptionConfig()) is True
+
+    def test_decorrelated_active_channels_not_single_source(self, tmp_path):
+        from millet.transcribe import _is_single_source_stereo
+        t = self._t()
+        # Genuine remote call: both channels active, different content.
+        left = (15000 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+        right = (15000 * np.sin(2 * np.pi * 510 * t)).astype(np.int16)
+        wav = _write_stereo_lr(tmp_path / "real-call.wav", left, right)
+        assert _is_single_source_stereo(wav, TranscriptionConfig()) is False
+
+    def test_dispatch_falls_back_to_mono_for_single_source(self, tmp_path):
+        """dual-diarize + single-source stereo must NOT call the dual-diarize
+        path; it falls through to the mono pipeline (which reaches
+        _mixdown_to_mono)."""
+        t = self._t()
+        sig = (12000 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+        wav = _write_stereo_lr(tmp_path / "inroom.wav", sig, sig.copy())
+        # Stop the pipeline right at the mono entry point so we don't depend on
+        # real ASR/diarization: a sentinel exception proves the mono path was
+        # taken AND the dual-diarize path was not.
+        sentinel = RuntimeError("reached mono path")
+        with patch(
+            "millet.transcribe._transcribe_dual_diarize"
+        ) as mock_dd, patch(
+            "millet.transcribe._mixdown_to_mono", side_effect=sentinel
+        ) as mock_mono:
+            config = TranscriptionConfig(mixdown="dual-diarize")
+            with pytest.raises(RuntimeError, match="reached mono path"):
+                do_transcribe(str(wav), config)
+            mock_dd.assert_not_called()
+            mock_mono.assert_called_once()
+
+    def test_dispatch_uses_dual_diarize_for_real_call(self, tmp_path):
+        """dual-diarize + decorrelated active channels must dispatch to the
+        dual-diarize path (no regression for genuine remote calls)."""
+        t = self._t()
+        left = (15000 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+        right = (15000 * np.sin(2 * np.pi * 510 * t)).astype(np.int16)
+        wav = _write_stereo_lr(tmp_path / "real.wav", left, right)
+        dummy = Transcript(
+            segments=[], speakers=[], language="en",
+            audio_file=str(wav), duration=3.0,
+        )
+        with patch(
+            "millet.transcribe._transcribe_dual_diarize", return_value=dummy
+        ) as mock_dd:
+            config = TranscriptionConfig(mixdown="dual-diarize")
+            result = do_transcribe(str(wav), config)
+            mock_dd.assert_called_once()
+            assert result is dummy
+
+    def test_fallback_disabled_keeps_dual_diarize(self, tmp_path):
+        """--no-single-source-fallback keeps the old behavior."""
+        t = self._t()
+        sig = (12000 * np.sin(2 * np.pi * 200 * t)).astype(np.int16)
+        wav = _write_stereo_lr(tmp_path / "inroom2.wav", sig, sig.copy())
+        dummy = Transcript(
+            segments=[], speakers=[], language="en",
+            audio_file=str(wav), duration=3.0,
+        )
+        with patch(
+            "millet.transcribe._transcribe_dual_diarize", return_value=dummy
+        ) as mock_dd:
+            config = TranscriptionConfig(
+                mixdown="dual-diarize", single_source_fallback=False,
+            )
+            result = do_transcribe(str(wav), config)
+            mock_dd.assert_called_once()
+            assert result is dummy
+
+
 # ─── Hybrid channel-energy correction ──────────────────────────────────────
 
 
