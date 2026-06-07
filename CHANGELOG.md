@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.12.7 — Single-source path: keep diarized in-room speakers
+
+### Fixed
+
+* **Second collapse in the single-source fallback.**  v0.12.6 routed in-room
+  recordings to the mono path, which correctly diarized two in-room speakers —
+  but the mono path then remapped the diarized speakers onto YOU/REMOTE by
+  channel energy.  On dual-mono audio every speaker is equally "mic-dominant",
+  so that remap collapsed the genuine speakers back into one.  The mono path
+  now **skips** the channel-energy YOU/REMOTE relabeling (and the channel
+  correction) when the recording was detected as single-source, keeping the
+  pyannote diarization result (`SPEAKER_00`/`SPEAKER_01`/…) so voiceprint
+  naming can label each in-room speaker.
+
 ## v0.12.6 — Fix in-room multi-speaker collapse in the dual-diarize path
 
 ### Fixed

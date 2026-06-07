@@ -1899,6 +1899,12 @@ def transcribe(
             "using standard mono pipeline"
         )
 
+    # When True, this stereo file is effectively single-source (in-room):
+    # the channels carry no real YOU-vs-REMOTE separation, so the mono path
+    # must NOT remap diarized speakers onto YOU/REMOTE by channel energy
+    # (that would collapse the genuine in-room speakers back into one).
+    single_source = False
+
     if is_stereo and config.use_dual_channel and config.mixdown == "dual-diarize":
         # The dual-diarize path treats the mic channel as a single local
         # speaker.  For an in-room recording (multiple people share the mic,
@@ -1908,6 +1914,7 @@ def transcribe(
         if config.single_source_fallback and _is_single_source_stereo(
             audio_path, config
         ):
+            single_source = True
             print(
                 "  Single-source stereo detected (system channel inactive or "
                 "duplicate) — using mono diarization to split in-room speakers"
@@ -2053,7 +2060,12 @@ def transcribe(
         speakers = [Speaker(id=sid) for sid in sorted(speaker_ids)]
 
         # ── Step 5: Dual-channel speaker labeling ──
-        if is_stereo and config.use_dual_channel:
+        # Skip for single-source (in-room) recordings: the channels carry no
+        # real YOU/REMOTE separation, so mapping diarized speakers onto
+        # channel energy would collapse the genuine in-room speakers (all are
+        # "mic-dominant") back into one.  Keep the pyannote diarization result
+        # (SPEAKER_00/_01/…) and let voiceprint naming label them.
+        if is_stereo and config.use_dual_channel and not single_source:
             if len(speakers) >= 2:
                 # Pyannote found multiple speakers — map them to YOU/REMOTE
                 # using channel energy ratios.
