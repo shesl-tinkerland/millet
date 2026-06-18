@@ -9,16 +9,18 @@ from unittest.mock import patch
 import numpy as np
 
 from millet.label import (
+    REMOTE_ABSORB_MAX_SEGMENTS,
     SpeakerInfo,
     _detect_speaker_channels,
     _find_session_files,
     _load_transcript,
+    absorb_unresolved_remote,
     apply_labels,
     extract_speaker_clip,
     get_speakers,
     relabel_transcript_in_memory,
 )
-from millet.transcribe import Segment, Speaker
+from millet.transcribe import Segment, Speaker, Transcript
 
 # ─── _find_session_files() ─────────────────────────────────────────────────
 
@@ -571,3 +573,94 @@ class TestRelabelSpeakerDedup:
         )
         out = relabel_transcript_in_memory(txn, {"YOU": "Kasita", "REMOTE_1": "Ahmad"})
         assert [s.id for s in out.speakers] == ["Kasita", "Ahmad"]
+
+
+# ─── absorb_unresolved_remote: rescue the leftover REMOTE bucket (A1, 0.12.12) ─
+# The dual-diarize path leaves a small literal REMOTE bucket (unassigned system
+# segments + non-overlapping mic bleed) AFTER consolidation, so it never merges
+# and rarely voiceprint-matches.  This forces needs_labeling even when every
+# real participant was identified.  absorb_unresolved_remote folds a SMALL such
+# leftover onto the named speaker it overlaps most in time.
+
+class TestAbsorbUnresolvedRemote:
+    def _txn(self, segments):
+        speakers = []
+        seen = set()
+        for s in segments:
+            if s.speaker and s.speaker not in seen:
+                seen.add(s.speaker)
+                speakers.append(Speaker(id=s.speaker, label=s.speaker))
+        return Transcript(
+            segments=segments, speakers=speakers, language="en",
+            audio_file="x.ogg", duration=100.0,
+        )
+
+    def test_small_remote_absorbed_into_overlapping_named(self):
+        # REMOTE one-liners interleaved with Openoms' speech → absorbed to Openoms.
+        segs = [
+            Segment(start=0.0, end=10.0, text="long openoms turn", speaker="Openoms"),
+            Segment(start=10.2, end=10.6, text="yeah", speaker="REMOTE"),
+            Segment(start=11.0, end=20.0, text="more openoms", speaker="Openoms"),
+            Segment(start=20.1, end=20.5, text="ok", speaker="REMOTE"),
+            Segment(start=30.0, end=40.0, text="hoang turn", speaker="Hoang"),
+        ]
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms", "Hoang"})
+        assert absorb == {"REMOTE": "Openoms"}
+
+    def test_remote_absorbed_into_nearest_when_no_overlap(self):
+        # REMOTE one-liner between turns, no direct overlap → nearest named wins.
+        segs = [
+            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
+            Segment(start=50.0, end=50.4, text="yeah", speaker="REMOTE"),  # nearer Hoang
+            Segment(start=51.0, end=60.0, text="hoang", speaker="Hoang"),
+        ]
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms", "Hoang"})
+        assert absorb == {"REMOTE": "Hoang"}
+
+    def test_large_remote_not_absorbed(self):
+        # A substantial unknown (> max seconds) stays raw for human review.
+        segs = [Segment(start=0.0, end=5.0, text="openoms", speaker="Openoms")]
+        # 40s of REMOTE speech across many segments → over the 30s cap.
+        for i in range(20):
+            segs.append(Segment(start=100.0 + i * 3, end=100.0 + i * 3 + 2.0,
+                                text="unknown person talking", speaker="REMOTE"))
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms"})
+        assert absorb == {}
+
+    def test_too_many_remote_segments_not_absorbed(self):
+        segs = [Segment(start=0.0, end=5.0, text="openoms", speaker="Openoms")]
+        # Many tiny segments (> max count) but little total time.
+        for i in range(REMOTE_ABSORB_MAX_SEGMENTS + 5):
+            segs.append(Segment(start=100.0 + i, end=100.0 + i + 0.2,
+                                text="x", speaker="REMOTE"))
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms"})
+        assert absorb == {}
+
+    def test_no_named_speakers_no_absorb(self):
+        segs = [Segment(start=0.0, end=2.0, text="yeah", speaker="REMOTE")]
+        txn = self._txn(segs)
+        assert absorb_unresolved_remote(txn, set()) == {}
+
+    def test_resolved_remote_not_touched(self):
+        # If REMOTE was already matched (in resolved_ids), it's not raw → skip.
+        segs = [
+            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
+            Segment(start=10.2, end=10.6, text="yeah", speaker="REMOTE"),
+        ]
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms", "REMOTE"})
+        assert absorb == {}
+
+    def test_raw_speaker_n_also_absorbed(self):
+        # A leftover raw SPEAKER_n (not just literal REMOTE) is eligible too.
+        segs = [
+            Segment(start=0.0, end=10.0, text="openoms", speaker="Openoms"),
+            Segment(start=10.2, end=10.6, text="yeah", speaker="SPEAKER_03"),
+        ]
+        txn = self._txn(segs)
+        absorb = absorb_unresolved_remote(txn, {"Openoms"})
+        assert absorb == {"SPEAKER_03": "Openoms"}

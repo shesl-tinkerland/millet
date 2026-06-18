@@ -198,6 +198,7 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
 
     # ── Voice profile auto-identification ──
     auto_matches: dict = {}
+    transcript = None
     wav_path = files.get("wav")
     channel_map: dict[str, str] = {}
 
@@ -308,6 +309,31 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
                     f"  {sp.id} -> {click.style(match.name, fg='green')}  ({match.confidence:.0%})"
                 )
         click.echo()
+
+    # ── Rescue the leftover REMOTE bucket (A1) ──
+    # The dual-diarize path creates a literal REMOTE (and can leave raw
+    # SPEAKER_n) AFTER consolidation runs, so it never merges and its mixed/thin
+    # backchannel rarely voiceprint-matches.  When every real participant was
+    # identified, that single small leftover shouldn't force needs_labeling.
+    # Absorb a SMALL unresolved raw cluster into the named speaker it overlaps
+    # most in time.  Only when at least one speaker was named (so we have a
+    # target) and we're in auto mode.
+    if auto and applied_matches and transcript is not None:
+        from millet.label import absorb_unresolved_remote
+
+        resolved_ids = set(label_map.values())
+        absorb = absorb_unresolved_remote(transcript, resolved_ids)
+        if absorb:
+            click.echo("Absorbing leftover unidentified remote segments:")
+            for raw_id, name in sorted(absorb.items()):
+                label_map[raw_id] = name
+                click.echo(
+                    f"  {raw_id} -> {click.style(name, fg='green')}  "
+                    f"(overlap-absorbed)"
+                )
+            click.echo()
+            # These are now resolved → drop from the unrecognized set.
+            unrecognized = [sp for sp in speakers if sp.id not in label_map]
 
     # Interactive labeling for unrecognized speakers (or all speakers if not --auto)
     speakers_to_prompt = unrecognized if auto else speakers

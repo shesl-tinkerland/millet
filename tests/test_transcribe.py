@@ -21,6 +21,7 @@ from millet.transcribe import (
     _consolidate_remote_clusters,
     _correct_mic_bleed_segments,
     _dominant_channel_language,
+    _isolated_backchannel_outliers,
     _merge_orphan_system_segments,
     _nearest_segment,
     _resolve_channel_language,
@@ -1267,6 +1268,70 @@ class TestMergeOrphanSystemSegments:
         segs = [_seg(0, 0.5, None)]
         _merge_orphan_system_segments(segs, self._cfg())
         assert segs[0]["speaker"] is None
+
+
+class TestIsolatedBackchannel:
+    """B1 (issue #2): strip far-isolated sub-threshold backchannel fragments
+    that pyannote mis-clustered into a later speaker."""
+
+    def _cfg(self, **kw):
+        return TranscriptionConfig(
+            device="cpu",
+            backchannel_max_seconds=1.5,
+            cluster_isolation_gap_seconds=300.0,
+            **kw,
+        )
+
+    def test_isolated_short_fragment_flagged(self):
+        # Mirrors the Kim case: tiny early fragments, then real speech 25 min on.
+        segs = [
+            _seg(11.0, 11.5, "SPEAKER_02"),   # 0.5s, isolated
+            _seg(53.5, 53.8, "SPEAKER_02"),   # 0.3s, isolated
+            _seg(1588.0, 1600.0, "SPEAKER_02"),  # real mass (12s)
+            _seg(1605.0, 1620.0, "SPEAKER_02"),
+        ]
+        flagged = _isolated_backchannel_outliers(segs, self._cfg())
+        assert flagged == [0, 1]
+
+    def test_short_fragment_near_own_speech_kept(self):
+        # A quick "yeah" right next to the speaker's real speech is NOT stripped.
+        segs = [
+            _seg(0.0, 12.0, "SPEAKER_00"),    # real mass
+            _seg(12.3, 12.7, "SPEAKER_00"),   # 0.4s, but adjacent → keep
+        ]
+        assert _isolated_backchannel_outliers(segs, self._cfg()) == []
+
+    def test_long_isolated_segment_kept(self):
+        # A substantive (>=1.5s) isolated segment carries embedding weight → keep.
+        segs = [
+            _seg(10.0, 13.0, "SPEAKER_02"),   # 3s isolated — NOT a backchannel
+            _seg(1588.0, 1600.0, "SPEAKER_02"),
+        ]
+        assert _isolated_backchannel_outliers(segs, self._cfg()) == []
+
+    def test_all_backchannel_cluster_kept(self):
+        # A cluster with NO real (>=1.5s) segment is left alone (that's the
+        # REMOTE-rescue's job, not this guard).
+        segs = [
+            _seg(10.0, 10.4, "SPEAKER_05"),
+            _seg(900.0, 900.3, "SPEAKER_05"),
+        ]
+        assert _isolated_backchannel_outliers(segs, self._cfg()) == []
+
+    def test_disabled_via_config_is_independent(self):
+        # The helper itself doesn't check the flag (caller does); ensure it
+        # still computes deterministically regardless.
+        segs = [
+            _seg(11.0, 11.4, "SPEAKER_02"),
+            _seg(1588.0, 1600.0, "SPEAKER_02"),
+        ]
+        assert _isolated_backchannel_outliers(segs, self._cfg()) == [0]
+
+    def test_config_defaults(self):
+        c = TranscriptionConfig(device="cpu")
+        assert c.strip_isolated_backchannel is True
+        assert c.backchannel_max_seconds == 1.5
+        assert c.cluster_isolation_gap_seconds == 300.0
 
 
 class TestNearestSegment:

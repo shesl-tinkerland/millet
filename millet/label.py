@@ -345,6 +345,101 @@ def play_clip(clip_path: str | Path) -> subprocess.Popen:
     )
 
 
+# ─── Rescue the leftover REMOTE bucket (A1, 0.12.12) ─────────────────────────
+
+import re as _re  # noqa: E402
+
+# Raw, auto-generated speaker ids that mean "not yet identified".
+_RAW_SPEAKER_RE = _re.compile(r"^(REMOTE(?:_\d+)?|SPEAKER_\d+)$")
+
+# A leftover REMOTE bucket is only auto-absorbed when it's SMALL — it's the
+# catch-all for unassigned system segments + non-overlapping mic-bleed, i.e.
+# short backchannel from several people that won't voiceprint-match cleanly.
+# Above these limits we keep it raw so a human reviews a substantial unknown.
+REMOTE_ABSORB_MAX_SECONDS = 30.0
+REMOTE_ABSORB_MAX_SEGMENTS = 25
+
+
+def _is_raw_speaker(sid: str) -> bool:
+    return bool(_RAW_SPEAKER_RE.match(sid or ""))
+
+
+def absorb_unresolved_remote(
+    transcript: Transcript,
+    resolved_ids: set[str],
+) -> dict[str, str]:
+    """Map small unresolved raw clusters onto the named speaker they overlap.
+
+    The dual-diarize path creates a literal ``REMOTE`` bucket (and can leave
+    raw ``SPEAKER_n``) *after* cluster consolidation runs, so it never gets a
+    chance to merge and its mixed/thin backchannel audio rarely voiceprint-
+    matches.  That single leftover then forces the whole session into
+    needs_labeling even when every real participant was identified.
+
+    For each raw cluster that is SMALL (≤ ``REMOTE_ABSORB_MAX_SECONDS`` of
+    speech and ≤ ``REMOTE_ABSORB_MAX_SEGMENTS`` segments), find the *named*
+    (resolved) speaker whose segments overlap it most in time and absorb it
+    there.  Large unknowns are left raw for human review (unchanged behavior).
+
+    Returns ``{raw_id: resolved_name}`` for clusters to absorb (possibly empty).
+    Pure/deterministic; the caller folds the result into the label_map.
+    """
+    # Per-raw-cluster: total speech + segment list; per-named: time intervals.
+    raw_speech: dict[str, float] = {}
+    raw_count: dict[str, int] = {}
+    raw_segs: dict[str, list[tuple[float, float]]] = {}
+    named_segs: dict[str, list[tuple[float, float]]] = {}
+    for seg in transcript.segments:
+        sid = seg.speaker or ""
+        if not sid:
+            continue
+        s, e = float(seg.start), float(seg.end)
+        if _is_raw_speaker(sid) and sid not in resolved_ids:
+            raw_speech[sid] = raw_speech.get(sid, 0.0) + max(0.0, e - s)
+            raw_count[sid] = raw_count.get(sid, 0) + 1
+            raw_segs.setdefault(sid, []).append((s, e))
+        elif sid in resolved_ids:
+            named_segs.setdefault(sid, []).append((s, e))
+
+    if not raw_segs or not named_segs:
+        return {}
+
+    def _overlap(a: tuple[float, float], intervals: list[tuple[float, float]]) -> float:
+        # Sum of temporal overlap of `a` with a named speaker's intervals,
+        # plus a tie-break proximity bonus (inverse distance to nearest).
+        s0, e0 = a
+        total = 0.0
+        nearest = float("inf")
+        for s1, e1 in intervals:
+            ov = min(e0, e1) - max(s0, s1)
+            if ov > 0:
+                total += ov
+            else:
+                nearest = min(nearest, max(s1 - e0, s0 - e1))
+        if total > 0:
+            return total
+        # No direct overlap → small negative score by distance so the closest
+        # named speaker still wins over a far one (REMOTE one-liners between
+        # turns).  Scaled to stay below any real overlap.
+        return -nearest if nearest != float("inf") else -1e9
+
+    absorb: dict[str, str] = {}
+    for rid, segs in raw_segs.items():
+        if raw_speech.get(rid, 0.0) > REMOTE_ABSORB_MAX_SECONDS:
+            continue
+        if raw_count.get(rid, 0) > REMOTE_ABSORB_MAX_SEGMENTS:
+            continue
+        scores: dict[str, float] = {}
+        for s, e in segs:
+            for name, intervals in named_segs.items():
+                scores[name] = scores.get(name, 0.0) + _overlap((s, e), intervals)
+        if not scores:
+            continue
+        best = max(scores, key=lambda n: scores[n])
+        absorb[rid] = best
+    return absorb
+
+
 # ─── Apply labels ──────────────────────────────────────────────────────────
 
 def apply_labels(

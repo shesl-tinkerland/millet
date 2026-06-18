@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.12.12 — Rescue the leftover REMOTE bucket; strip mis-clustered backchannel
+
+### Fixed
+
+* **A single unidentified `REMOTE` forced needs_labeling even when every real
+  participant was matched (A1).**  The dual-diarize path creates a literal
+  `REMOTE` bucket — system segments pyannote left unassigned, plus mic-bleed
+  segments with no temporally-overlapping diarized remote — *after* cluster
+  consolidation runs, so it never merges, and its mixed/thin backchannel audio
+  rarely voiceprint-matches.  That one leftover then sent the whole session to
+  manual labeling (and, once a human named it, produced a duplicate speaker).
+
+  `label --auto` now runs `absorb_unresolved_remote()` after applying confident
+  matches: a **small** unresolved raw cluster (≤ 30 s of speech and ≤ 25
+  segments) is absorbed into the *named* speaker it overlaps most in time.
+  Large unknowns are still left raw for human review.
+
+* **Backchannel mis-attributed to a late-joining speaker (B1, issue #2).**
+  pyannote sometimes lumps a few early sub-1.5 s utterances ("yeah", "ok") into
+  a cluster whose real speaker only appears much later (e.g. someone who joins
+  25 min in); voiceprint then names the whole cluster, so those early fragments
+  inherit the wrong name.  A new guard
+  (`TranscriptionConfig.strip_isolated_backchannel`, default on) reassigns
+  fragments that are both below `backchannel_max_seconds` (1.5 s) **and** more
+  than `cluster_isolation_gap_seconds` (5 min) from the nearest real
+  (≥ `MIN_SEGMENT_DURATION`) segment of their own cluster to the generic
+  `REMOTE` bucket — which the A1 rescue then re-homes.  Conservative: only
+  touches non-embeddable, far-isolated fragments.  See
+  `docs/spike-diarization-cluster-bleed.md` for the analysis.
+
 ## v0.12.11 — One speaker per person: many-to-one voiceprint matching + speaker de-dup
 
 ### Fixed

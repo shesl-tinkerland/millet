@@ -536,6 +536,20 @@ class TranscriptionConfig:
     # otherwise become a generic REMOTE speaker) are merged into the nearest
     # remote cluster when shorter than this many seconds.
     orphan_merge_max_seconds: float = 1.0
+    # ── Isolated-backchannel guard (B1, 0.12.12) ──
+    # pyannote sometimes lumps a few early sub-threshold backchannel utterances
+    # ("yeah", "ok") into a cluster whose real speaker only appears much later
+    # (e.g. someone who joins 25 min in).  Such fragments are below
+    # MIN_SEGMENT_DURATION (so they contribute no embedding) yet inherit the
+    # cluster's voiceprint-resolved name.  When a fragment is shorter than
+    # ``backchannel_max_seconds`` AND is more than
+    # ``cluster_isolation_gap_seconds`` from the nearest >=MIN_SEGMENT_DURATION
+    # segment of its own cluster, reassign it to the generic REMOTE bucket (the
+    # later REMOTE-rescue / labeling step re-homes it).  Conservative: only
+    # touches non-embeddable, far-isolated fragments.
+    strip_isolated_backchannel: bool = True
+    backchannel_max_seconds: float = 1.5
+    cluster_isolation_gap_seconds: float = 300.0
 
     # ── Single-source detection (dual-diarize path) ──
     # The dual-diarize path assumes the mic (left) channel carries exactly one
@@ -1624,6 +1638,60 @@ def _merge_orphan_system_segments(
             seg["speaker"] = nearest["speaker"]
 
 
+def _isolated_backchannel_outliers(
+    sys_segments: list,
+    config: TranscriptionConfig,
+) -> list[int]:
+    """Indices of sub-threshold segments isolated from their cluster's mass.
+
+    See ``docs/spike-diarization-cluster-bleed.md`` (issue #2).  pyannote can
+    lump a few early sub-``MIN_SEGMENT_DURATION`` backchannel utterances into a
+    cluster whose real speaker only appears much later.  Those fragments carry
+    no embedding weight but inherit the cluster's resolved name.
+
+    A segment is flagged when:
+      * its duration < ``config.backchannel_max_seconds``; AND
+      * its cluster has at least one ``>= MIN_SEGMENT_DURATION`` ("real")
+        segment; AND
+      * the nearest such real segment of the SAME cluster is more than
+        ``config.cluster_isolation_gap_seconds`` away in time.
+
+    Returns indices into ``sys_segments`` (does not mutate).  Conservative by
+    design — only isolated, non-embeddable fragments qualify.
+    """
+    from millet.voiceprint import MIN_SEGMENT_DURATION
+
+    # Per cluster: list of (start, end) for "real" (embeddable) segments.
+    real_by_cluster: dict[str, list[tuple[float, float]]] = {}
+    for seg in sys_segments:
+        spk = seg.get("speaker")
+        if not spk:
+            continue
+        s, e = float(seg["start"]), float(seg["end"])
+        if (e - s) >= MIN_SEGMENT_DURATION:
+            real_by_cluster.setdefault(spk, []).append((s, e))
+
+    flagged: list[int] = []
+    for i, seg in enumerate(sys_segments):
+        spk = seg.get("speaker")
+        if not spk:
+            continue
+        s, e = float(seg["start"]), float(seg["end"])
+        if (e - s) >= config.backchannel_max_seconds:
+            continue
+        real = real_by_cluster.get(spk)
+        if not real:
+            continue  # cluster is ALL backchannel — leave it (not this case)
+        mid = (s + e) / 2.0
+        nearest_gap = min(
+            (max(rs - mid, mid - re, 0.0) for rs, re in real),
+            default=float("inf"),
+        )
+        if nearest_gap > config.cluster_isolation_gap_seconds:
+            flagged.append(i)
+    return flagged
+
+
 def _consolidate_dual_diarize_speakers(
     sys_result: dict,
     sys_audio,
@@ -1681,6 +1749,25 @@ def _consolidate_dual_diarize_speakers(
         print(f"  Consolidated remote clusters: {merged_desc}")
 
     _merge_orphan_system_segments(sys_segments, config)
+
+    # ── Strip isolated sub-threshold backchannel (B1, issue #2) ──
+    # Reassign far-isolated, non-embeddable fragments out of a named cluster
+    # into the generic REMOTE bucket so they don't inherit the wrong speaker.
+    if config.strip_isolated_backchannel:
+        try:
+            outliers = _isolated_backchannel_outliers(sys_segments, config)
+        except Exception as exc:  # never fail transcription over this
+            print(f"  Warning: isolated-backchannel guard skipped ({exc})")
+            outliers = []
+        if outliers:
+            for i in outliers:
+                sys_segments[i]["speaker"] = "REMOTE"
+                for w in sys_segments[i].get("words") or []:
+                    w["speaker"] = "REMOTE"
+            print(
+                f"  Stripped {len(outliers)} isolated backchannel "
+                f"segment(s) to REMOTE (likely mis-clustered)"
+            )
 
 
 def _transcribe_dual_diarize(
