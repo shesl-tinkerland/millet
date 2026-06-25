@@ -335,6 +335,29 @@ def label(session_dir, no_audio, no_summary, auto, summary_preset, summary_backe
             # These are now resolved → drop from the unrecognized set.
             unrecognized = [sp for sp in speakers if sp.id not in label_map]
 
+    # ── Fold spurious TINY noise clusters into the dominant speaker (A2) ──
+    # A backchannel one-liner or distorted blip on the system channel becomes
+    # its own raw cluster that voiceprint can't match.  Unlike the rescue above
+    # this needs no NAMED target — it folds the tiny cluster into whoever speaks
+    # most (even another raw id), so a single noise blip can't force an
+    # otherwise-clean session into needs_labeling.  Runs in auto mode even when
+    # no confident voiceprint match was applied.
+    if auto and transcript is not None:
+        from millet.label import absorb_tiny_speakers
+
+        resolved_ids = set(label_map.values())
+        tiny_absorb = absorb_tiny_speakers(transcript, resolved_ids)
+        if tiny_absorb:
+            click.echo("Folding tiny noise speaker(s) into the dominant speaker:")
+            for raw_id, target in sorted(tiny_absorb.items()):
+                label_map[raw_id] = label_map.get(target, target)
+                click.echo(
+                    f"  {raw_id} -> {click.style(label_map[raw_id], fg='green')}  "
+                    f"(tiny-noise-absorbed)"
+                )
+            click.echo()
+            unrecognized = [sp for sp in speakers if sp.id not in label_map]
+
     # Interactive labeling for unrecognized speakers (or all speakers if not --auto)
     speakers_to_prompt = unrecognized if auto else speakers
 

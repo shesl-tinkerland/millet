@@ -10,10 +10,13 @@ import numpy as np
 
 from millet.label import (
     REMOTE_ABSORB_MAX_SEGMENTS,
+    TINY_SPEAKER_MAX_SECONDS,
+    TINY_SPEAKER_MAX_SEGMENTS,
     SpeakerInfo,
     _detect_speaker_channels,
     _find_session_files,
     _load_transcript,
+    absorb_tiny_speakers,
     absorb_unresolved_remote,
     apply_labels,
     extract_speaker_clip,
@@ -678,3 +681,97 @@ class TestAbsorbUnresolvedRemote:
         txn = self._txn(segs)
         absorb = absorb_unresolved_remote(txn, {"Openoms"})
         assert absorb == {"SPEAKER_03": "Openoms"}
+
+
+# ─── absorb_tiny_speakers: fold spurious noise into the DOMINANT speaker (A2) ─
+# Complements absorb_unresolved_remote for the common case where the dominant
+# speaker is itself an unmatched SPEAKER_n: a single 1-3 segment / few-second
+# REMOTE blip should fold into the real conversation rather than force review.
+
+class TestAbsorbTinySpeakers:
+    def _txn(self, segments):
+        speakers = []
+        seen = set()
+        for s in segments:
+            if s.speaker and s.speaker not in seen:
+                seen.add(s.speaker)
+                speakers.append(Speaker(id=s.speaker, label=s.speaker))
+        return Transcript(
+            segments=segments, speakers=speakers, language="en",
+            audio_file="x.ogg", duration=1000.0,
+        )
+
+    def test_tiny_remote_folds_into_unmatched_dominant(self):
+        # The 01KV8G41 case: big UNMATCHED SPEAKER_00 + tiny REMOTE.
+        segs = [
+            Segment(start=0.0, end=300.0, text="long unmatched turn", speaker="SPEAKER_00"),
+            Segment(start=312.6, end=313.7, text="Thank you.", speaker="REMOTE"),
+            Segment(start=864.0, end=866.1, text="Fine.", speaker="REMOTE"),
+        ]
+        txn = self._txn(segs)
+        # No named speaker → absorb_unresolved_remote can't help.
+        assert absorb_unresolved_remote(txn, set()) == {}
+        # But the tiny REMOTE folds into the dominant raw speaker.
+        assert absorb_tiny_speakers(txn, set()) == {"REMOTE": "SPEAKER_00"}
+
+    def test_tiny_remote_folds_into_named_when_present(self):
+        segs = [
+            Segment(start=0.0, end=300.0, text="long", speaker="Openoms"),
+            Segment(start=310.0, end=310.2, text="yeah", speaker="REMOTE"),
+        ]
+        txn = self._txn(segs)
+        assert absorb_tiny_speakers(txn, {"Openoms"}) == {"REMOTE": "Openoms"}
+
+    def test_substantial_unmatched_not_folded(self):
+        # A genuine unlabeled participant (above thresholds) stays raw.
+        segs = [
+            Segment(start=0.0, end=300.0, text="main", speaker="SPEAKER_00"),
+            # SPEAKER_01: well above 5.0s and 3 segments.
+            Segment(start=300.0, end=320.0, text="real other person", speaker="SPEAKER_01"),
+            Segment(start=330.0, end=345.0, text="more", speaker="SPEAKER_01"),
+            Segment(start=350.0, end=360.0, text="and more", speaker="SPEAKER_01"),
+            Segment(start=370.0, end=380.0, text="still talking", speaker="SPEAKER_01"),
+        ]
+        txn = self._txn(segs)
+        assert absorb_tiny_speakers(txn, set()) == {}
+
+    def test_all_tiny_nothing_folded(self):
+        # No real conversation to fold into → bail (let the worker decide).
+        segs = [
+            Segment(start=0.0, end=0.2, text="x", speaker="REMOTE"),
+            Segment(start=5.0, end=5.3, text="y", speaker="SPEAKER_00"),
+        ]
+        txn = self._txn(segs)
+        assert absorb_tiny_speakers(txn, set()) == {}
+
+    def test_named_speaker_never_folded_even_if_tiny(self):
+        # A resolved/named tiny speaker is not a noise placeholder.
+        segs = [
+            Segment(start=0.0, end=300.0, text="main", speaker="SPEAKER_00"),
+            Segment(start=310.0, end=310.2, text="hi", speaker="Alice"),
+        ]
+        txn = self._txn(segs)
+        # Alice is resolved → not eligible; nothing else tiny+raw to fold.
+        assert absorb_tiny_speakers(txn, {"Alice"}) == {}
+
+    def test_boundary_at_thresholds_is_tiny(self):
+        # Exactly 5.0s across exactly 3 segments → still tiny (<=).
+        segs = [
+            Segment(start=0.0, end=300.0, text="main", speaker="SPEAKER_00"),
+            Segment(start=400.0, end=402.0, text="a", speaker="REMOTE"),
+            Segment(start=410.0, end=412.0, text="b", speaker="REMOTE"),
+            Segment(start=420.0, end=421.0, text="c", speaker="REMOTE"),
+        ]
+        txn = self._txn(segs)
+        assert TINY_SPEAKER_MAX_SECONDS == 5.0
+        assert TINY_SPEAKER_MAX_SEGMENTS == 3
+        assert absorb_tiny_speakers(txn, set()) == {"REMOTE": "SPEAKER_00"}
+
+    def test_just_over_segment_threshold_not_tiny(self):
+        # 4 short segments (> 3) but tiny duration → not folded (count gate).
+        segs = [Segment(start=0.0, end=300.0, text="main", speaker="SPEAKER_00")]
+        for i in range(4):
+            segs.append(Segment(start=400.0 + i, end=400.0 + i + 0.2,
+                                text="x", speaker="REMOTE"))
+        txn = self._txn(segs)
+        assert absorb_tiny_speakers(txn, set()) == {}

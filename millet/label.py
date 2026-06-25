@@ -362,6 +362,15 @@ _RAW_SPEAKER_RE = _re.compile(r"^(REMOTE(?:_\d+)?|SPEAKER_\d+)$")
 REMOTE_ABSORB_MAX_SECONDS = 30.0
 REMOTE_ABSORB_MAX_SEGMENTS = 25
 
+# A "tiny" raw cluster is spurious noise — a one-liner backchannel or heavily
+# distorted blip on the system channel that diarization split off and that
+# voiceprint can't match.  Unlike ``absorb_unresolved_remote`` (which needs a
+# *named* target), a tiny cluster is folded into the DOMINANT speaker by speech
+# time even when that dominant speaker is itself still raw/unmatched, so a
+# single noise blip no longer forces an otherwise-clean session into review.
+TINY_SPEAKER_MAX_SECONDS = 5.0
+TINY_SPEAKER_MAX_SEGMENTS = 3
+
 
 def _is_raw_speaker(sid: str) -> bool:
     return bool(_RAW_SPEAKER_RE.match(sid or ""))
@@ -440,6 +449,95 @@ def absorb_unresolved_remote(
             continue
         best = max(scores, key=lambda n: scores[n])
         absorb[rid] = best
+    return absorb
+
+
+def absorb_tiny_speakers(
+    transcript: Transcript,
+    resolved_ids: set[str],
+) -> dict[str, str]:
+    """Fold spurious *tiny* raw clusters into the dominant speaker.
+
+    Complements :func:`absorb_unresolved_remote`, which only works when a
+    *named* speaker exists to absorb into.  In the common failure case the
+    dominant speaker is itself an unmatched ``SPEAKER_n`` and the only leftover
+    is a 1-3 segment / few-second ``REMOTE`` (a backchannel one-liner or a
+    distorted noise blip).  That single tiny cluster otherwise forces the whole
+    session into ``needs_labeling`` even though there is nothing meaningful to
+    label.
+
+    For each raw cluster that is TINY (``<= TINY_SPEAKER_MAX_SECONDS`` of speech
+    AND ``<= TINY_SPEAKER_MAX_SEGMENTS`` segments) and not already resolved,
+    fold it into the speaker with the most total speech time (preferring the
+    speaker it overlaps most, falling back to the overall dominant speaker).
+    The target may itself be a raw id — the point is to collapse noise into the
+    real conversation, not to name it.
+
+    Returns ``{tiny_id: target_id}`` (possibly empty).  Pure/deterministic; the
+    caller folds the result into the label_map.  A tiny cluster is never folded
+    into another tiny cluster, and if *every* speaker is tiny nothing is folded
+    (the whole session is noise — let the worker decide its fate).
+    """
+    speech: dict[str, float] = {}
+    count: dict[str, int] = {}
+    segs_by: dict[str, list[tuple[float, float]]] = {}
+    for seg in transcript.segments:
+        sid = seg.speaker or ""
+        if not sid:
+            continue
+        s, e = float(seg.start), float(seg.end)
+        speech[sid] = speech.get(sid, 0.0) + max(0.0, e - s)
+        count[sid] = count.get(sid, 0) + 1
+        segs_by.setdefault(sid, []).append((s, e))
+
+    if not speech:
+        return {}
+
+    def _tiny(sid: str) -> bool:
+        return (
+            speech.get(sid, 0.0) <= TINY_SPEAKER_MAX_SECONDS
+            and count.get(sid, 0) <= TINY_SPEAKER_MAX_SEGMENTS
+        )
+
+    tiny = {
+        sid for sid in speech
+        if _is_raw_speaker(sid) and sid not in resolved_ids and _tiny(sid)
+    }
+    if not tiny:
+        return {}
+
+    # Candidate targets: any non-tiny speaker (named or raw).  If all speakers
+    # are tiny, there's no real conversation to fold into — bail.
+    targets = [sid for sid in speech if sid not in tiny]
+    if not targets:
+        return {}
+
+    def _overlap_score(a: tuple[float, float], sid: str) -> float:
+        s0, e0 = a
+        total = 0.0
+        nearest = float("inf")
+        for s1, e1 in segs_by.get(sid, []):
+            ov = min(e0, e1) - max(s0, s1)
+            if ov > 0:
+                total += ov
+            else:
+                nearest = min(nearest, max(s1 - e0, s0 - e1))
+        if total > 0:
+            return total
+        return -nearest if nearest != float("inf") else -1e9
+
+    absorb: dict[str, str] = {}
+    for tid in tiny:
+        scores: dict[str, float] = {}
+        for s, e in segs_by[tid]:
+            for sid in targets:
+                scores[sid] = scores.get(sid, 0.0) + _overlap_score((s, e), sid)
+        # Tie-break / no-overlap fallback: the overall dominant speaker by speech.
+        if not scores or max(scores.values()) <= 0:
+            best = max(targets, key=lambda s: speech.get(s, 0.0))
+        else:
+            best = max(scores, key=lambda s: scores[s])
+        absorb[tid] = best
     return absorb
 
 

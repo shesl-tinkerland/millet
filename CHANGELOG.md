@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.12.15 — Fold spurious tiny noise speakers into the dominant speaker
+
+### Fixed
+
+* **A single tiny `REMOTE`/`SPEAKER_n` noise blip forced needs_labeling even
+  when there was no real participant to absorb it into (A2).**  `0.12.12`'s
+  `absorb_unresolved_remote()` only folds a leftover raw cluster into a
+  *named* speaker.  In the common case the dominant speaker is itself an
+  unmatched `SPEAKER_n`, so a 1–3 segment / few-second backchannel one-liner
+  or a heavily distorted blip had no absorb target and survived as its own
+  speaker — sending the whole session to manual labeling for nothing.
+
+  `label --auto` now also runs `absorb_tiny_speakers()` after the existing
+  rescue: a **tiny** unresolved raw cluster (≤ `TINY_SPEAKER_MAX_SECONDS`
+  = 5.0 s of speech **and** ≤ `TINY_SPEAKER_MAX_SEGMENTS` = 3 segments) is
+  folded into the speaker with the most overlapping/total speech time — even
+  when that dominant speaker is itself still raw.  Tiny clusters are never
+  folded into another tiny cluster, and if *every* speaker is tiny nothing is
+  folded (the whole recording is noise — the caller decides its fate).  This
+  runs in auto mode even when no confident voiceprint match was applied.
+
 ## v0.12.14 — Discover MP3 audio in session directories (release fix)
 
 Re-release of 0.12.13: the 0.12.13 tag built the wrong version because the
