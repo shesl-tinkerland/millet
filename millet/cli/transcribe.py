@@ -255,6 +255,24 @@ def transcribe(
                 f"Error: no audio file (.wav/.ogg/.mp3) found in {audio_path}", err=True
             )
             raise SystemExit(1)
+        if len(audio_files) > 1:
+            # Refuse to silently transcribe only the first of several files.
+            # A session dir is expected to hold exactly one continuous
+            # recording; multiple files almost always means the caller
+            # intended them merged (see vezir multi-audio uploads, which
+            # concatenate before invoking transcribe).  Fail loudly with the
+            # list so the mistake is visible rather than producing a
+            # transcript that silently drops most of the meeting.
+            listing = "\n".join(f"  - {p.name}" for p in audio_files)
+            click.echo(
+                f"Error: {len(audio_files)} audio files found in {audio_path}; "
+                "transcribe expects a single recording.\n"
+                f"{listing}\n"
+                "Merge them into one file first (e.g. ffmpeg concat) or pass "
+                "the specific file you want.",
+                err=True,
+            )
+            raise SystemExit(1)
         audio_path = audio_files[0]
         click.echo(f"  Resolved to: {audio_path}")
 

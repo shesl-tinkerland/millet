@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.12.16 — transcribe: fail loudly on multiple files in a directory
+
+### Changed
+
+* **`millet transcribe <dir>` no longer silently transcribes only the first
+  audio file when several are present.**  Previously a directory with multiple
+  `.wav`/`.ogg`/`.mp3` files resolved to `audio_files[0]` (alphabetically
+  first), silently dropping the rest — producing a transcript that quietly
+  omitted most of a meeting.  It now errors with the full file listing and
+  guidance to merge the files first (or pass the specific file).  A single
+  file in a directory resolves exactly as before, so existing single-recording
+  session dirs (and Vezir's post-merge session dirs) are unaffected.
+
+  This pairs with Vezir 0.9.0's multi-audio meetings, where several uploaded
+  files are concatenated into one recording *before* `transcribe` runs.
+
 ## v0.12.15 — Fold spurious tiny noise speakers into the dominant speaker
 
 ### Fixed
